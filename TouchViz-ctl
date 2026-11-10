@@ -1,0 +1,75 @@
+#!/bin/bash
+# TouchViz 控制脚本: start | stop | restart | status | toggle
+# 选项可用环境变量覆盖，例如: SCROLL=1 ./TouchViz-ctl restart
+BIN=${BIN:-/usr/local/bin/TouchViz}
+[ -x "$BIN" ] || BIN="$(dirname "$(readlink -f "$0")")/TouchViz"
+LOG=/tmp/TouchViz.log
+
+# DISPLAY 没设时(登录自启/无图形环境调用)自己找到可用的 X 显示
+if [ -z "$DISPLAY" ]; then
+    for s in /tmp/.X11-unix/X*; do
+        [ -e "$s" ] || continue
+        d=":${s##*/X}"
+        if command -v xdpyinfo >/dev/null 2>&1; then
+            xdpyinfo -display "$d" >/dev/null 2>&1 && { export DISPLAY="$d"; break; }
+        elif command -v xset >/dev/null 2>&1; then
+            xset -display "$d" q >/dev/null 2>&1 && { export DISPLAY="$d"; break; }
+        else
+            export DISPLAY="$d"; break
+        fi
+    done
+fi
+export DISPLAY=${DISPLAY:-:0}
+
+LONG_PRESS=${LONG_PRESS:-600}     # 长按总时长(ms)到点发右键，0=关闭
+LP_ARM=${LP_ARM:-200}             # 长按稳定期(ms)：这段内不显示进度环
+LP_MOVE=${LP_MOVE:-18}            # 长按允许的手指漂移(px)，超了就取消
+SCROLL=${SCROLL:-0}               # 1=开启双指滑动转滚轮
+RIGHTCLICK_AT=${RIGHTCLICK_AT:-}  # press(默认,当场发) | release(抬手后发)
+OVERLAY=${OVERLAY:-1}             # 0=只做增强，不显示触点
+RIGHTCLICK=${RIGHTCLICK:-1}
+TRAIL=${TRAIL:-1}                 # 0=关闭滑动拖尾
+HIDE_CURSOR=${HIDE_CURSOR:-1}     # 0=触控时不隐藏鼠标指针
+
+args() {
+    a=""
+    [ "$OVERLAY" = "0" ] && a="$a --no-overlay"
+    [ "$RIGHTCLICK" = "0" ] && a="$a --no-rightclick"
+    [ "$SCROLL" = "1" ] && a="$a --scroll"
+    [ "$TRAIL" = "0" ] && a="$a --no-trail"
+    [ "$HIDE_CURSOR" = "0" ] && a="$a --no-hide-cursor"
+    [ -n "$RIGHTCLICK_AT" ] && a="$a --rightclick-at $RIGHTCLICK_AT"
+    a="$a --long-press $LONG_PRESS --lp-arm $LP_ARM --lp-move $LP_MOVE"
+    echo "$a"
+}
+
+stop() {
+    pkill -f '[t]ouchviz .*--long-press' 2>/dev/null
+    pkill -x TouchViz 2>/dev/null
+    sleep 0.3
+}
+start() {
+    stop
+    setsid "$BIN" $(args) >"$LOG" 2>&1 </dev/null &
+    sleep 0.8
+    status
+}
+status() {
+    if pgrep -x TouchViz >/dev/null; then
+        echo "TouchViz: 运行中  (pid $(pgrep -x TouchViz | tr '\n' ' '))"
+        tail -n 3 "$LOG" 2>/dev/null | sed 's/^/  /'
+    else
+        echo "TouchViz: 未运行"
+    fi
+}
+
+case "${1:-status}" in
+    start)   start ;;
+    stop)    stop; status ;;
+    restart) start ;;
+    toggle)  if pgrep -x TouchViz >/dev/null; then stop; status; else start; fi ;;
+    status)  status ;;
+    -h|--help|*) echo "用法: $0 {start|stop|restart|status|toggle}"
+                 echo "环境变量: LONG_PRESS=600 LP_ARM=200 LP_MOVE=18 SCROLL=0 OVERLAY=1 RIGHTCLICK=1 TRAIL=1 HIDE_CURSOR=1|0 RIGHTCLICK_AT=press|release"
+                 echo "          LP_ARM=200 LP_MOVE=18  BIN=路径";;
+esac
