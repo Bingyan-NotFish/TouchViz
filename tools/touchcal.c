@@ -1,32 +1,4 @@
-/* ============================================================================
- * touchcal —— 触控偏移标定 / 验证（全屏，需要人配合点屏幕）
- *
- * 它做的事：
- *   1. 全屏显示黑底 + 若干十字目标（默认 5 个：正中 + 四角）；
- *   2. 你按提示用手指（或用鼠标当手指）点每个十字的正中心；
- *   3. 每次点数它记录三件事：
- *        • 目标位置 target          —— 你看到并瞄准的位置
- *        • 指针落点 pointer         —— 系统认为你点的位置（触控会移动指针）
- *        • 设备量程 + 变换矩阵      —— 现场从 X 里读
- *      屏幕上会用红线画出「目标 → 落点」的偏差，肉眼就能看到偏多少；
- *   4. 全部点完给出：每点偏差、平均/最大偏差、逐轴线性拟合，
- *      算出能把偏差抵掉的 Coordinate Transformation Matrix；
- *   5. --apply 直接写回设备（本会话生效），并可多轮验证改完的效果；
- *   6. 结果同时写到报告文件（默认 /tmp/touchcal-report.txt），可以贴给别人看。
- *
- * 用法：
- *   ./touchcal                      # 5 个点，只测量（不动系统设置）
- *   ./touchcal --points 9           # 3x3 九个点，更稳
- *   ./touchcal --apply              # 测完立刻应用，并自动再测一轮验证
- *   ./touchcal --device 21          # 指定设备（多块触控屏时）
- *   ./touchcal --rounds 1           # 只测一轮
- *   ./touchcal --report /tmp/x.txt  # 报告写到别处
- *
- * 按键：Esc / q 中止；r 重新开始本轮；space 跳过当前点。
- *
- * 依赖：libX11 + libXi（和 TouchViz 同一套），不需要 python/ImageMagick/root。
- * 注意：真触控屏请先把 TouchViz 停掉（TouchViz-ctl stop），它的覆盖层会盖住目标。
- * ==========================================================================*/
+// touchcal：触控偏移标定 / 验证
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -46,6 +18,8 @@
 #include <X11/extensions/XInput2.h>
 #include <X11/extensions/XInput.h>
 
+// ---------- 1. 常量 / 全局 ----------
+
 #define MAXPT 16
 
 typedef struct {
@@ -59,11 +33,16 @@ typedef struct {
     int    has_ctm;
 } Dev;
 
-typedef struct { double tx, ty; double px, py; int done; int skipped; int istouch; } Point;
+typedef struct {
+    double tx, ty;
+    double px, py;
+    int    done, skipped;
+    int    istouch;
+} Point;
 
 static Display *dpy;
 static int      scr, xi_opcode;
-static int      W, H;          /* 根窗口尺寸 */
+static int      W, H;
 static Window   win;
 static GC       gc;
 static XFontStruct *font;
@@ -74,17 +53,19 @@ static int      dev_ok = 0;
 static int  npoints = 5;
 static int  rounds = 1;
 static int  apply  = 0;
-static int  take_clicks = 1;   /* 鼠标左键也可以当“点”（--no-click 关掉） */
+static int  take_clicks = 1;
 static int  win_timeout = 0;
 static const char *report_path = "/tmp/touchcal-report.txt";
 static FILE *rep;
 
 static Point pts[MAXPT];
-static int   cur = 0;        /* 当前目标下标 */
+static int   cur = 0;
 static int   round_no = 1;
 static long  last_tap_ms = 0;
 static volatile sig_atomic_t stop_flag = 0;
 static int click_hinted = 0;
+
+static unsigned long COL_FG, COL_CUR, COL_DONE, COL_ERR;
 
 static void on_sig(int s) { (void)s; stop_flag = 1; }
 
@@ -100,20 +81,28 @@ static void say(const char *fmt, ...) {
     if (rep) { va_start(ap, fmt); vfprintf(rep, fmt, ap); va_end(ap); fputc('\n', rep); fflush(rep); }
 }
 
-/* ---------------------------------------------------------------- 设备 */
+// ---------- 2. 设备属性 ----------
 
 static int get_dev_prop(int devid, const char *name, unsigned char **data,
                         int *nitems, int *format) {
+    if (data)   *data = NULL;
+    if (nitems) *nitems = 0;
+    if (format) *format = 0;
     Atom prop = XInternAtom(dpy, name, True), type = None;
     if (prop == None) return 0;
     XDevice *d = XOpenDevice(dpy, devid);
     if (!d) return 0;
+    unsigned char *buf = NULL;
     unsigned long n = 0, after = 0;
     int ok = (XGetDeviceProperty(dpy, d, prop, 0, 64, False, AnyPropertyType,
-                                 &type, format, &n, &after, data) == Success);
+                                 &type, format, &n, &after, &buf) == Success);
     XCloseDevice(dpy, d);
-    if (!ok || !*data || n == 0) { if (*data) { XFree(*data); *data = NULL; } return 0; }
-    *nitems = (int)n;
+    if (!ok || !buf || n == 0) {
+        if (buf) XFree(buf);
+        return 0;
+    }
+    if (data) *data = buf; else XFree(buf);
+    if (nitems) *nitems = (int)n;
     return 1;
 }
 
@@ -125,7 +114,8 @@ static int read_ctm(int devid, double m[9]) {
     if (fmt == 32 && n >= 9) {
         const unsigned long *u = (const unsigned long *)data;
         for (int i = 0; i < 9; i++) {
-            uint32_t bits = (uint32_t)u[i]; float f; memcpy(&f, &bits, 4);
+            uint32_t bits = (uint32_t)u[i];
+            float f; memcpy(&f, &bits, 4);
             m[i] = f;
         }
     }
@@ -134,14 +124,16 @@ static int read_ctm(int devid, double m[9]) {
 }
 
 static int write_ctm(int devid, const double m[9]) {
+    Atom prop = XInternAtom(dpy, "Coordinate Transformation Matrix", False);
+    Atom type = XInternAtom(dpy, "FLOAT", False);
+    if (prop == None || type == None) return 0;
     long v[9];
     for (int i = 0; i < 9; i++) {
         float f = (float)m[i]; uint32_t bits; memcpy(&bits, &f, 4); v[i] = (long)bits;
     }
     XDevice *d = XOpenDevice(dpy, devid);
     if (!d) return 0;
-    XChangeDeviceProperty(dpy, d, XInternAtom(dpy, "Coordinate Transformation Matrix", False),
-                          XInternAtom(dpy, "FLOAT", False), 32, PropModeReplace,
+    XChangeDeviceProperty(dpy, d, prop, type, 32, PropModeReplace,
                           (unsigned char *)v, 9);
     XSync(dpy, False);
     XCloseDevice(dpy, d);
@@ -179,8 +171,9 @@ static void load_dev(Dev *d, XIDeviceInfo *info) {
     }
 }
 
-/* 挑一块真触控设备：优先名字里没有 TouchInject 的（虚拟测试设备排最后） */
 static int pick_device(int want_id) {
+    have_touch = 0;
+    dev_ok = 0;
     int n = 0, best = -1, best_score = -1, ntouch = 0;
     XIDeviceInfo *info = XIQueryDevice(dpy, XIAllDevices, &n);
     if (!info) return 0;
@@ -198,16 +191,12 @@ static int pick_device(int want_id) {
         if (score > best_score) { best_score = score; best = d.id; dev = d; }
     }
     XIFreeDeviceInfo(info);
-    if (want_id > 0 && best < 0) return 0;
-    if (want_id <= 0 && best < 0) return 0;
     have_touch = (ntouch > 0);
     dev_ok = (best >= 0);
-    return 1;
+    return dev_ok ? 1 : 0;
 }
 
-/* ---------------------------------------------------------------- 绘制 */
-
-static void set_color(GC g, unsigned long px) { XSetForeground(dpy, g, px); }
+// ---------- 3. 绘制 ----------
 
 static unsigned long alloc_color(const char *name, unsigned long fallback) {
     XColor c, exact;
@@ -215,11 +204,9 @@ static unsigned long alloc_color(const char *name, unsigned long fallback) {
     return fallback;
 }
 
-static unsigned long COL_FG, COL_CUR, COL_DONE, COL_ERR;
-
 static void draw_target(double x, double y, int idx, int is_cur) {
     int R = is_cur ? 26 : 14;
-    set_color(gc, is_cur ? COL_CUR : COL_DONE);
+    XSetForeground(dpy, gc, is_cur ? COL_CUR : COL_DONE);
     XDrawLine(dpy, win, gc, (int)x - R, (int)y, (int)x + R, (int)y);
     XDrawLine(dpy, win, gc, (int)x, (int)y - R, (int)x, (int)y + R);
     XDrawArc(dpy, win, gc, (int)x - R / 2, (int)y - R / 2, R, R, 0, 360 * 64);
@@ -231,12 +218,12 @@ static void draw_target(double x, double y, int idx, int is_cur) {
 
 static void draw(void) {
     XClearWindow(dpy, win);
-    char head[256];
     int done = 0;
     for (int i = 0; i < npoints; i++) if (pts[i].done) done++;
 
     if (font) {
-        set_color(gc, COL_FG);
+        char head[256];
+        XSetForeground(dpy, gc, COL_FG);
         snprintf(head, sizeof head,
                  "touchcal  round %d/%d   tap the CENTER of the crosshair   (%d/%d)   Esc=abort  r=redo",
                  round_no, rounds, done, npoints);
@@ -246,11 +233,10 @@ static void draw(void) {
             : "no touch device - left-click the target (mouse as finger)";
         XDrawString(dpy, win, gc, 24, 48, sub, (int)strlen(sub));
     }
-    /* 已完成的点：目标(绿) + 落点(红) + 偏差线 */
     for (int i = 0; i < npoints; i++) {
         if (!pts[i].done) continue;
         if (!pts[i].skipped) {
-            set_color(gc, COL_ERR);
+            XSetForeground(dpy, gc, COL_ERR);
             XDrawLine(dpy, win, gc, (int)pts[i].tx, (int)pts[i].ty, (int)pts[i].px, (int)pts[i].py);
             XFillArc(dpy, win, gc, (int)pts[i].px - 3, (int)pts[i].py - 3, 6, 6, 0, 360 * 64);
         }
@@ -261,27 +247,29 @@ static void draw(void) {
 }
 
 static void make_points(void) {
-    double xs[3] = {0.08, 0.5, 0.92}, ys[3] = {0.08, 0.5, 0.92};
+    static const double xs3[3] = {0.08, 0.5, 0.92};
+    static const double ys3[3] = {0.08, 0.5, 0.92};
+    static const double tx5[5] = {0.5, 0.08, 0.92, 0.08, 0.92};
+    static const double ty5[5] = {0.5, 0.08, 0.08, 0.92, 0.92};
     int n = 0;
     if (npoints <= 5) {
-        /* 中心 + 四角（中心先点，便于确认设备是不是在工作） */
-        pts[n].tx = 0.5 * W; pts[n].ty = 0.5 * H; n++;
-        pts[n].tx = 0.08 * W; pts[n].ty = 0.08 * H; n++;
-        pts[n].tx = 0.92 * W; pts[n].ty = 0.08 * H; n++;
-        pts[n].tx = 0.08 * W; pts[n].ty = 0.92 * H; n++;
-        pts[n].tx = 0.92 * W; pts[n].ty = 0.92 * H; n++;
+        for (int i = 0; i < npoints && n < MAXPT; i++, n++) {
+            pts[n].tx = tx5[i] * W; pts[n].ty = ty5[i] * H;
+        }
     } else {
-        for (int j = 0; j < 3; j++)
-            for (int i = 0; i < 3; i++) {
-                pts[n].tx = xs[i] * W; pts[n].ty = ys[j] * H; n++;
+        for (int j = 0; j < 3 && n < MAXPT; j++)
+            for (int i = 0; i < 3 && n < MAXPT; i++, n++) {
+                pts[n].tx = xs3[i] * W; pts[n].ty = ys3[j] * H;
             }
     }
-    for (int i = 0; i < n; i++) { pts[i].done = 0; pts[i].skipped = 0; pts[i].istouch = 0;
-                                  pts[i].px = pts[i].py = -1; }
+    for (int i = 0; i < n; i++) {
+        pts[i].done = 0; pts[i].skipped = 0; pts[i].istouch = 0;
+        pts[i].px = pts[i].py = -1;
+    }
     cur = 0;
 }
 
-/* ---------------------------------------------------------------- 拟合 */
+// ---------- 4. 拟合 ----------
 
 static void fit1(const double *x, const double *y, int n, double *a, double *b) {
     double sx = 0, sy = 0, sxx = 0, sxy = 0;
@@ -301,10 +289,10 @@ static void mat3_mul(const double A[9], const double B[9], double C[9]) {
         }
 }
 
-/* ---------------------------------------------------------------- 收尾计算 */
+// ---------- 5. 收尾计算 ----------
 
 static int analyze(int do_apply, int show_fix) {
-    int n = 0;
+    int n_all = 0, n_fit = 0;
     double ox[MAXPT], oy[MAXPT], tx[MAXPT], ty[MAXPT];
     double maxe = 0, sumx = 0, sumy = 0;
     for (int i = 0; i < npoints; i++) {
@@ -313,51 +301,53 @@ static int analyze(int do_apply, int show_fix) {
         double e = sqrt(dx*dx + dy*dy);
         if (e > maxe) maxe = e;
         sumx += dx; sumy += dy;
+        n_all++;
         say("  点%d  目标=(%7.1f,%7.1f)  落点=(%7.1f,%7.1f)  偏差=(%+7.1f,%+7.1f)  |偏差|=%.1f",
             i + 1, pts[i].tx, pts[i].ty, pts[i].px, pts[i].py, dx, dy, e);
-        ox[n] = pts[i].px / (double)(W - 1); oy[n] = pts[i].py / (double)(H - 1);
-        tx[n] = pts[i].tx / (double)(W - 1); ty[n] = pts[i].ty / (double)(H - 1);
-        n++;
+        if (!pts[i].istouch) continue;
+        ox[n_fit] = pts[i].px / (double)(W - 1);
+        oy[n_fit] = pts[i].py / (double)(H - 1);
+        tx[n_fit] = pts[i].tx / (double)(W - 1);
+        ty[n_fit] = pts[i].ty / (double)(H - 1);
+        n_fit++;
     }
-    if (n == 0) { say("  没采到有效点。"); return 0; }
+    if (n_all == 0) { say("  没采到有效点。"); return 0; }
 
-    int ntouch = 0;
-    for (int i = 0; i < npoints; i++)
-        if (pts[i].done && !pts[i].skipped && pts[i].istouch) ntouch++;
-
-    double mx = sumx / n, my = sumy / n;
+    double mx = sumx / n_all, my = sumy / n_all;
     double vx = 0, vy = 0;
     for (int i = 0; i < npoints; i++) {
         if (!pts[i].done || pts[i].skipped) continue;
         double dx = pts[i].px - pts[i].tx - mx, dy = pts[i].py - pts[i].ty - my;
         vx += dx*dx; vy += dy*dy;
     }
-    double sdx = sqrt(vx / n), sdy = sqrt(vy / n);
+    double sdx = sqrt(vx / n_all), sdy = sqrt(vy / n_all);
     say("  平均偏差 = (%+.1f, %+.1f) px    最大 = %.1f px    离散度 = (%.1f, %.1f) px",
         mx, my, maxe, sdx, sdy);
 
-    if (ntouch == 0) {
+    if (n_fit == 0) {
         say("");
-        say("注意：这 %d 个点全是鼠标点击（[click]/[mouse]），点击位置本来就等于指针位置。", n);
+        say("注意：这 %d 个点全是鼠标点击（[click]/[mouse]），点击位置本来就等于指针位置。", n_all);
         say("      所以这里量不出触控偏移，也不会生成校正矩阵。");
         say("      要测真实偏移：用指头点，或先跑 tools/mouse_touch_test.sh 让鼠标经由虚拟触控屏注入。");
         return 1;
     }
-    if (ntouch < n)
-        say("  （其中 %d/%d 个点是鼠标点击，只作参考，不参与后面的拟合判断）", n - ntouch, n);
+    if (n_fit < 2) {
+        say("  只有 1 个触控点，无法拟合（至少 2 个）。");
+        return 1;
+    }
+    if (n_fit < n_all)
+        say("  （其中 %d/%d 个点是鼠标点击，只作参考，不参与拟合）", n_all - n_fit, n_all);
 
     if (fabs(mx) > W / 8 && sdx < 30)
         say("  ⚠ 偏差主要是“整体平移”，像是设备被映射到了别的输出/半屏 —— "
             "这种情况更应该用 touchprobe map --rect 把设备映射到正确的屏，而不是标定。");
 
-    /* 拟合：目标 = a*落点 + b （逐轴独立，稳） */
     double ax, bx, ay, by;
-    fit1(ox, tx, n, &ax, &bx);
-    fit1(oy, ty, n, &ay, &by);
+    fit1(ox, tx, n_fit, &ax, &bx);
+    fit1(oy, ty, n_fit, &ay, &by);
     say("  拟合：目标x = %.6f*落点x%+.6f    目标y = %.6f*落点y%+.6f  （归一化坐标）",
         ax, bx, ay, by);
 
-    /* 新矩阵 = F · 当前矩阵 */
     double F[9] = { ax, 0, bx, 0, ay, by, 0, 0, 1 };
     double M1[9];
     mat3_mul(F, dev.ctm, M1);
@@ -388,7 +378,6 @@ static int analyze(int do_apply, int show_fix) {
         }
     }
 
-    /* 给一份能长期生效的 xorg 配置（按设备名匹配，不改系统文件也能先看看） */
     say("");
     say("  想长期生效（重启后仍在），把下面存成 /etc/X11/xorg.conf.d/99-touchcal.conf：");
     say("    Section \"InputClass\"");
@@ -401,7 +390,7 @@ static int analyze(int do_apply, int show_fix) {
     return 1;
 }
 
-/* ---------------------------------------------------------------- 事件 */
+// ---------- 6. 事件 ----------
 
 static void pointer_pos(int *px, int *py) {
     Window r, c; int rx, ry, wx, wy; unsigned int m;
@@ -422,7 +411,7 @@ static void pointer_settled(int *px, int *py) {
 static void record_tap(double px, double py, const char *how) {
     if (cur >= npoints) return;
     long t = now_ms();
-    if (t - last_tap_ms < 300) return;      /* 防抖：一次触摸会来好几个事件 */
+    if (t - last_tap_ms < 300) return;
     last_tap_ms = t;
     pts[cur].px = px; pts[cur].py = py;
     pts[cur].done = 1; pts[cur].skipped = 0;
@@ -449,6 +438,8 @@ static void record_tap(double px, double py, const char *how) {
     }
 }
 
+// ---------- 7. main ----------
+
 int main(int argc, char **argv) {
     int want_dev = 0;
     for (int i = 1; i < argc; i++) {
@@ -461,15 +452,26 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--no-click")) take_clicks = 0;
         else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) win_timeout = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            fputs("用法: touchcal [--points 5|9] [--rounds N] [--device ID] [--apply] [--no-click] [--report 路径]\n"
-                  "           [--timeout 秒]\n"
-                  "  Esc/q 中止，r 重来，空格跳过当前点\n", stderr);
-            return 2;
+            printf("用法: touchcal [选项]\n"
+                   "  全屏触摸标定/验证：在屏幕上点十字，拟合 a*x+b 校正矩阵。\n"
+                   "选项:\n"
+                   "  --points N     采样点数（默认 %d，<3 会限制为 3，最大 %d）\n"
+                   "  --rounds N     测几轮（默认 %d，--apply 时至少 2 轮）\n"
+                   "  --device ID    指定触控设备 ID（默认自动选）\n"
+                   "  --apply        测完把校正矩阵写回设备\n"
+                   "  --click        同时接受鼠标点击（默认）\n"
+                   "  --no-click     只接受触控，不接受鼠标\n"
+                   "  --report 路径  报告文件路径（默认 /tmp/touchcal-report.txt）\n"
+                   "  --timeout 秒   窗口超时秒数（0=不限时）\n"
+                   "交互: Esc/q 中止，r 重来，空格跳过当前点\n",
+                   npoints, MAXPT, rounds);
+            return 0;
         } else { fprintf(stderr, "未知参数: %s\n", argv[i]); return 2; }
     }
-    if (npoints < 3) npoints = 5;
+    // 本轮改动：<3 时限制为 3（原来静默改为 5），尊重用户输入
+    if (npoints < 3) npoints = 3;
     if (npoints > MAXPT) npoints = MAXPT;
-    if (apply && rounds < 2) rounds = 2;      /* 应用后自动再测一轮 */
+    if (apply && rounds < 2) rounds = 2;
 
     dpy = XOpenDisplay(NULL);
     if (!dpy) { fprintf(stderr, "连不上 X（DISPLAY='%s'）\n", getenv("DISPLAY") ? getenv("DISPLAY") : ""); return 1; }
@@ -501,8 +503,8 @@ int main(int argc, char **argv) {
             say("提示：如果是真触控屏，先把 TouchViz 停掉（TouchViz-ctl stop），它的覆盖层会盖住目标。");
     }
 
-    /* 全屏窗口 */
     XSetWindowAttributes at;
+    memset(&at, 0, sizeof at);
     at.override_redirect = True;
     at.background_pixel = BlackPixel(dpy, scr);
     at.event_mask = ExposureMask | KeyPressMask | ButtonPressMask | StructureNotifyMask;
@@ -520,11 +522,9 @@ int main(int argc, char **argv) {
     COL_DONE = alloc_color("green",  WhitePixel(dpy, scr));
     COL_ERR  = alloc_color("red",    WhitePixel(dpy, scr));
 
-    /* 键盘（Esc/r/space） */
-    set_color(gc, COL_FG);
-    XGrabKeyboard(dpy, win, False, GrabModeAsync, GrabModeAsync, CurrentTime);
+    if (XGrabKeyboard(dpy, win, False, GrabModeAsync, GrabModeAsync, CurrentTime) != GrabSuccess)
+        fprintf(stderr, "touchcal: 键盘 grab 失败（Esc 可能不生效）\n");
 
-    /* 原始触控事件 */
     unsigned char mask[XIMaskLen(XI_LASTEVENT)];
     memset(mask, 0, sizeof mask);
     XISetMask(mask, XI_RawTouchBegin);
@@ -541,17 +541,27 @@ int main(int argc, char **argv) {
     while (!stop_flag) {
         while (XPending(dpy)) {
             XEvent e; XNextEvent(dpy, &e);
-            if (e.type == Expose && e.xexpose.count == 0) { XRaiseWindow(dpy, win); draw(); }
-            else if (e.type == KeyPress) {
+            if (e.type == Expose && e.xexpose.count == 0) {
+                XRaiseWindow(dpy, win);
+                draw();
+            } else if (e.type == KeyPress) {
                 KeySym ks = XLookupKeysym(&e.xkey, 0);
-                if (ks == XK_Escape || ks == XK_q) { stop_flag = 1; }
-                else if (ks == XK_r) { make_points(); say("重来本轮。"); draw(); }
-                else if (ks == XK_space) {
-                    if (cur < npoints) { pts[cur].done = 1; pts[cur].skipped = 1; cur++;
-                                         say("跳过 点%d", cur); draw();
-                                         if (cur >= npoints) { analyze(0, 1); stop_flag = 1; } }
+                if (ks == XK_Escape || ks == XK_q) {
+                    stop_flag = 1;
+                } else if (ks == XK_r) {
+                    make_points();
+                    say("重来本轮。");
+                    draw();
+                } else if (ks == XK_space) {
+                    if (cur < npoints) {
+                        pts[cur].done = 1; pts[cur].skipped = 1; cur++;
+                        say("跳过 点%d", cur);
+                        draw();
+                        if (cur >= npoints) { analyze(0, 1); stop_flag = 1; }
+                    }
                 }
-            } else if (e.type == ButtonPress && e.xbutton.button == 1 && (!have_touch || take_clicks)) {
+            } else if (e.type == ButtonPress && e.xbutton.button == 1 &&
+                       (!have_touch || take_clicks)) {
                 int px, py; pointer_settled(&px, &py);
                 if (have_touch && !click_hinted) {
                     say("（提示：这次是鼠标点击。若你在用 tools/mouse_touch_test.sh 做“鼠标当手指”，"
@@ -562,18 +572,19 @@ int main(int argc, char **argv) {
             } else if (e.type == GenericEvent && e.xcookie.extension == xi_opcode) {
                 if (!XGetEventData(dpy, &e.xcookie)) continue;
                 if (e.xcookie.evtype == XI_RawTouchBegin) {
+                    // 本轮清理：不再判空 XIRawEvent*，只判空 valuators.mask 与 valuators.values
                     XIRawEvent *raw = (XIRawEvent *)e.xcookie.data;
                     int is_ours = dev_ok && raw->sourceid == dev.id;
-                    if (is_ours &&
-                        XIMaskIsSet(raw->valuators.mask, dev.vx) &&
-                        XIMaskIsSet(raw->valuators.mask, dev.vy)) {
-                        double nx = (raw->valuators.values[dev.vx] - dev.mnx) / (dev.mxx - dev.mnx) * (W - 1);
-                        double ny = (raw->valuators.values[dev.vy] - dev.mny) / (dev.mxy - dev.mny) * (H - 1);
-                        int px, py; pointer_settled(&px, &py);
-                        (void)nx; (void)ny;
-                        record_tap(px, py, "touch");
+                    if (is_ours) {
+                        int has_xy = raw->valuators.mask && raw->valuators.values;
+                        if (has_xy &&
+                            XIMaskIsSet(raw->valuators.mask, dev.vx) &&
+                            XIMaskIsSet(raw->valuators.mask, dev.vy)) {
+                            int px, py; pointer_settled(&px, &py);
+                            record_tap(px, py, "touch");
+                        }
                     } else if (have_touch) {
-                        /* 别的触控设备也接受，提示一下 */
+                        // 别的触控设备也接受，提示一下
                         int px, py; pointer_settled(&px, &py);
                         record_tap(px, py, "touch*");
                     }

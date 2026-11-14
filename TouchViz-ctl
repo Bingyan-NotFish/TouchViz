@@ -1,10 +1,12 @@
 #!/bin/bash
 # TouchViz 控制脚本: start | stop | restart | status | toggle
-# 选项可用环境变量覆盖，例如: SCROLL=1 ./TouchViz-ctl restart
-BIN=${BIN:-/usr/local/bin/TouchViz}
-[ -x "$BIN" ] || BIN="$(dirname "$(readlink -f "$0")")/TouchViz"
-LOG=/tmp/TouchViz.log
 
+# ---------- 1. 基础配置与日志 ----------
+BIN="${BIN:-/usr/local/bin/TouchViz}"
+[ -x "$BIN" ] || BIN="$(dirname "$(readlink -f "$0")")/TouchViz"
+LOG="/tmp/TouchViz.log"
+
+# ---------- 2. 智能探测 DISPLAY ----------
 # DISPLAY 没设时(登录自启/无图形环境调用)自己找到可用的 X 显示
 if [ -z "$DISPLAY" ]; then
     for s in /tmp/.X11-unix/X*; do
@@ -19,20 +21,22 @@ if [ -z "$DISPLAY" ]; then
         fi
     done
 fi
-export DISPLAY=${DISPLAY:-:0}
+export DISPLAY="${DISPLAY:-:0}"
 
-LONG_PRESS=${LONG_PRESS:-600}     # 长按总时长(ms)到点发右键，0=关闭
-LP_ARM=${LP_ARM:-200}             # 长按稳定期(ms)：这段内不显示进度环
-LP_MOVE=${LP_MOVE:-18}            # 长按允许的手指漂移(px)，超了就取消
-SCROLL=${SCROLL:-0}               # 1=开启双指滑动转滚轮
-RIGHTCLICK_AT=${RIGHTCLICK_AT:-}  # press(默认,当场发) | release(抬手后发)
-OVERLAY=${OVERLAY:-1}             # 0=只做增强，不显示触点
-RIGHTCLICK=${RIGHTCLICK:-1}
-TRAIL=${TRAIL:-1}                 # 0=关闭滑动拖尾
-HIDE_CURSOR=${HIDE_CURSOR:-1}     # 0=触控时不隐藏鼠标指针
+# ---------- 3. 环境变量与默认参数 ----------
+LONG_PRESS="${LONG_PRESS:-600}"       # 长按总时长(ms)到点发右键，0=关闭
+LP_ARM="${LP_ARM:-200}"               # 长按稳定期(ms)：这段内不显示进度环
+LP_MOVE="${LP_MOVE:-18}"              # 长按允许的手指漂移(px)，超了就取消
+SCROLL="${SCROLL:-0}"                 # 1=开启双指滑动转滚轮
+RIGHTCLICK_AT="${RIGHTCLICK_AT:-}"    # press(默认,当场发) | release(抬手后发)
+OVERLAY="${OVERLAY:-1}"               # 0=只做增强，不显示触点
+RIGHTCLICK="${RIGHTCLICK:-1}"         # 0=关闭长按发右键
+TRAIL="${TRAIL:-1}"                   # 0=关闭滑动拖尾
+HIDE_CURSOR="${HIDE_CURSOR:-1}"       # 0=触控时不隐藏鼠标指针
 
+# ---------- 4. 参数拼装函数 ----------
 args() {
-    a=""
+    local a=""
     [ "$OVERLAY" = "0" ] && a="$a --no-overlay"
     [ "$RIGHTCLICK" = "0" ] && a="$a --no-rightclick"
     [ "$SCROLL" = "1" ] && a="$a --scroll"
@@ -43,17 +47,20 @@ args() {
     echo "$a"
 }
 
+# ---------- 5. 核心控制函数 ----------
 stop() {
-    pkill -f '[t]ouchviz .*--long-press' 2>/dev/null
+    # 匹配进程名，忽略掉 pgrep 自身
     pkill -x TouchViz 2>/dev/null
     sleep 0.3
 }
+
 start() {
     stop
     setsid "$BIN" $(args) >"$LOG" 2>&1 </dev/null &
     sleep 0.8
     status
 }
+
 status() {
     if pgrep -x TouchViz >/dev/null; then
         echo "TouchViz: 运行中  (pid $(pgrep -x TouchViz | tr '\n' ' '))"
@@ -63,13 +70,38 @@ status() {
     fi
 }
 
+# ---------- 6. 主命令解析 ----------
 case "${1:-status}" in
     start)   start ;;
     stop)    stop; status ;;
     restart) start ;;
     toggle)  if pgrep -x TouchViz >/dev/null; then stop; status; else start; fi ;;
     status)  status ;;
-    -h|--help|*) echo "用法: $0 {start|stop|restart|status|toggle}"
-                 echo "环境变量: LONG_PRESS=600 LP_ARM=200 LP_MOVE=18 SCROLL=0 OVERLAY=1 RIGHTCLICK=1 TRAIL=1 HIDE_CURSOR=1|0 RIGHTCLICK_AT=press|release"
-                 echo "          LP_ARM=200 LP_MOVE=18  BIN=路径";;
+    -h|--help)
+        echo "用法: $0 {start|stop|restart|status|toggle}"
+        cat <<'EOF'
+  启动/停止/查看 TouchViz 的运行状态。
+命令:
+  start    停止旧实例并启动
+  stop     停止并显示状态
+  restart  同 start
+  status   显示运行状态与最近日志
+  toggle   运行中则停止，否则启动
+环境变量（在命令前设置，例如 LONG_PRESS=800 TouchViz-ctl start）:
+  LONG_PRESS=600      长按总时长(ms)，0=关闭长按
+  LP_ARM=200          稳定期(ms)：按下后多久才开始算进度
+  LP_MOVE=18          长按允许的手指漂移(px)，超出即作废
+  RIGHTCLICK_AT=press press(默认,当场发) | release(抬手后发)
+  SCROLL=0            1=开启双指滑动转滚轮
+  TRAIL=1             0=关闭滑动拖尾
+  OVERLAY=1           0=只做长按/隐藏指针，不显示触点
+  RIGHTCLICK=1        0=关闭长按发右键
+  HIDE_CURSOR=1       0=触控时不隐藏鼠标指针
+  BIN=路径            指定 TouchViz 二进制的路径
+EOF
+        ;;
+    *)
+        echo "未知命令: ${1:-}（--help 看用法）" >&2
+        exit 2
+        ;;
 esac

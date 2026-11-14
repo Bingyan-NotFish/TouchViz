@@ -1,60 +1,62 @@
 #!/bin/bash
-# ============================================================================
-# 单点位置精度：注入（或手指按）某个位置后，触点在屏幕上画在哪里。
-#
-# 用法:
-#   tools/verify_device.sh [标签] [注入命令] [期望x] [期望y]
-#     tools/verify_device.sh
-#     tools/verify_device.sh 右屏 "hold 2500 500 900"
-#     tools/verify_device.sh 自定义 "hold 800 600 900" 400 300   # 手动给期望落点
-#
-# 不给期望落点时会用 touchprobe expect 按设备变换矩阵算出来（注入坐标 -> 真实落点）。
-# 便携性: 不用 PIL / ImageMagick / kwin 截图 / xdotool；坐标和分辨率都现场算。
-# ============================================================================
+# 单点位置精度验证：注入点位，截屏找触点圆，计算真实偏移。
 set -u
 . "$(dirname "$0")/lib.sh"
 
-tv_need_probe
+usage() {
+    cat <<'EOF'
+用法: verify_device.sh [TAG] [PX] [PY] [EX] [EY]
+  注入一个点，截屏找触点圆，计算它与期望落点的真实偏移。
+  TAG        输出标签（默认 POS）
+  PX PY      注入坐标（默认按百分比 40% 30%）
+  EX EY      期望落点（默认用设备矩阵算）
+  -h, --help 显示本帮助
+EOF
+}
+
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+esac
 
 TAG="${1:-POS}"
-CMD="${2:-}"
-EX="${3:-}"
-EY="${4:-}"
+read -r PX PY <<<"$(tv_at ${2:-40} ${3:-30})"  # 默认用百分比，也可传确切坐标
+EX="${4:-}"
+EY="${5:-}"
 
+tv_need_probe
+
+# ---------- 1.准备环境 ----------
 if ! tv_has_inject; then
     "$TV_TOOLS/start_mtinject.sh" >/dev/null 2>&1 || { echo "没有触控设备" >&2; exit 1; }
 fi
 [ -p "$TV_FIFO" ] || { echo "FIFO 不在：先跑 tools/start_mtinject.sh" >&2; exit 1; }
 
-# 默认：在屏幕中间偏上注入一下
-if [ -z "$CMD" ]; then
-    read -r x y <<<"$(tv_at 40 30)"
-    CMD="hold $x $y 900"
+if [ -z "$EX" ]; then
+    # 没给期望点，就用设备的变换矩阵算一遍真实落点
+    read -r EX EY <<<"$(tv_expect "$PX" "$PY")"
 fi
-# 从命令里取注入坐标
-INJ=($(echo "$CMD" | awk '{for(i=2;i<=NF;i++) if ($i ~ /^[0-9]+$/) {print $i; if (++n==2) exit}}'))
-[ -n "$EX" ] || {
-    read -r EX EY <<<"$(tv_probe expect "${INJ[0]}" "${INJ[1]}" | sed -n 's/.*screen=\([0-9-]*\),\([0-9-]*\).*/\1 \2/p')"
-}
 
 pgrep -x TouchViz >/dev/null || tv_ctl start >/dev/null 2>&1
-sleep 0.8
-sleep 1.0                                             # 等上一次的淡出结束
+sleep 1.5 # 等待上一次的拖尾淡出
+
+# ---------- 2.注入并截图 ----------
 tv_shot "$TV_TMP/dev-before.ppm"
-tv_inject "$CMD"
+tv_inject "hold $PX $PY 900"
 sleep 0.45
 tv_shot "$TV_TMP/dev-during.ppm"
 sleep 1.5
 
+# ---------- 3.比对与找圆 ----------
 D=$(tv_diff "$TV_TMP/dev-before.ppm" "$TV_TMP/dev-during.ppm" "$EX" "$EY" 160 25 --centroid)
 R=$(tv_ring "$TV_TMP/dev-during.ppm" "$EX" "$EY" 100 || true)
 
-echo "[$TAG] 注入=$CMD  期望落点=($EX,$EY)"
-echo "       变化区域: $D"
-echo "       触点圆  : $R"
+echo "[$TAG] 注入=($PX,$PY)  期望=($EX,$EY)"
+echo "       变化: $D"
+echo "       触点: $R"
 
+# ---------- 4.计算偏移 ----------
 echo "$R" | awk -v ex="$EX" -v ey="$EY" -v tag="$TAG" '
-/^RING none/ { print "       ✗ 没有找到触点圆"; exit }
+/^RING none/ { print "       ✗ 未找到触点圆"; exit 1 }
 /^RING/ {
     for (i = 1; i <= NF; i++) {
         if ($i ~ /^center=/) { split($i, a, "[=,]"); cx = a[2]; cy = a[3] }

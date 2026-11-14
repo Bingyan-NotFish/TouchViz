@@ -1,33 +1,4 @@
-/* ============================================================================
- * touchprobe —— TouchViz 的便携诊断/验证工具
- *
- * 设计目标：**绝对的可移植性**
- *   • 只依赖 libX11 + libXi（项目本身就要这两个），不用 python/PIL/ImageMagick、
- *     不用 xdotool/xinput/qdbus、不读 /tmp 下的固定文件名、不需要 root。
- *   • DISPLAY 没设或设错时自动在 /tmp/.X11-unix/X* 里找可用的。
- *   • 屏幕尺寸、设备号、量程、变换矩阵全部现场查询，不写死任何坐标/分辨率。
- *   • 判断“有没有偏移”不需要截图：触控点落下时指针会被移到该点，
- *     所以把「按 TouchViz 公式算出的位置」和「指针真实位置」一比即可。
- *     需要看图形时才用内建的 XGetImage 截图 + PPM 比对（同样零外部依赖）。
- *
- * 子命令
- *   geom                       打印 DISPLAY / 屏幕尺寸
- *   devices                    列出所有直接触控设备：量程、变换矩阵、映射矩形
- *   expect <x> <y>             注入(或触摸)屏幕像素坐标 x,y 后，实际会落在哪里
- *   watch [-n N] [-t SEC] [--tol PX] [-q]
- *                              实时测量每次触控的偏移（TouchViz 公式 vs 指针）
- *   shot <out.ppm> [x y w h]   截取根窗口（PPM/P6，供 diff/ring 用）
- *   diff <a.ppm> <b.ppm> [x y w h [thr]] [--centroid]
- *                              两图差异：bbox / 最大差值 / 超阈值像素数 / 质心
- *   ring <a.ppm> <x> <y> <pad> [--tol N] [--color r,g,b]
- *                              在 (x,y) 附近找触点圆环，输出圆心与半径
- *   finger [--fifo P] [--max-hz N]
- *                              “鼠标当手指”：把左键按下/拖动/松开转发给 mtinject
- *   map [--dev ID] --full | --rect X Y W H | --reset | --show
- *                              读写设备的 Coordinate Transformation Matrix
- *
- * 退出码：watch 有超差返回 1；其余命令成功 0、失败非 0。
- * ==========================================================================*/
+// touchprobe：便携诊断/验证工具
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -47,15 +18,15 @@
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
 #include <X11/extensions/XInput2.h>
-#include <X11/extensions/XInput.h>    /* XGetDeviceProperty / XChangeDeviceProperty */
-#include <X11/extensions/XTest.h>      /* XTestFakeButtonEvent（TouchViz 本身也依赖它） */
-#include <X11/extensions/Xfixes.h>     /* XFixesGetCursorImage：判断指针是否被隐藏 */
+#include <X11/extensions/XInput.h>
+#include <X11/extensions/XTest.h>
+#include <X11/extensions/Xfixes.h>
+
+// ---------- 1. 全局 & 基础 ----------
 
 static Display *dpy;
 static int      xi_opcode = -1;
 static int      scr_w, scr_h;
-
-/* ------------------------------------------------------------------ 基础 */
 
 static void fatal(const char *fmt, ...) __attribute__((noreturn, format(printf, 1, 2)));
 static void fatal(const char *fmt, ...) {
@@ -69,13 +40,13 @@ static long now_ms(void) {
     return ts.tv_sec * 1000L + ts.tv_nsec / 1000000L;
 }
 
-/* 打开显示：DISPLAY 无效时自动扫描本地 X socket（:0..:9 / :10..） */
+// ---------- 2. X 连接 ----------
+
 static Display *open_display(void) {
     const char *d = getenv("DISPLAY");
-    Display *x = d && *d ? XOpenDisplay(NULL) : NULL;
+    Display *x = (d && *d) ? XOpenDisplay(NULL) : NULL;
     if (x) return x;
     char buf[32];
-    /* 先看 /tmp/.X11-unix 里有哪些 socket，再按号码试 */
     for (int n = 0; n < 64; n++) {
         char path[64];
         snprintf(path, sizeof(path), "/tmp/.X11-unix/X%d", n);
@@ -88,10 +59,8 @@ static Display *open_display(void) {
     return NULL;
 }
 
-/* 设备可能在枚举后就消失（热插拔/残留项）：忽略这类 X 错误，不要直接退出 */
 static int x_error_handler(Display *d, XErrorEvent *e) {
-    (void)d;
-    if (e->request_code == xi_opcode) return 0;          /* XInput 请求失败：自己往下走 */
+    if (e->request_code == xi_opcode) return 0;
     char buf[128];
     XGetErrorText(d, e->error_code, buf, sizeof buf);
     fprintf(stderr, "touchprobe: X 错误 %s (request %d.%d)\n", buf, e->request_code, e->minor_code);
@@ -113,18 +82,22 @@ static void open_xi(void) {
     scr_h = DisplayHeight(dpy, DefaultScreen(dpy));
 }
 
-/* 设备属性读取（XI1 的 XGetDeviceProperty 对 XI2 设备同样有效） */
+// ---------- 3. 设备属性读取 ----------
+
 static int get_dev_prop(int devid, const char *name, Atom req_type,
                         unsigned char **data, int *nitems, Atom *type, int *format) {
     Atom prop = XInternAtom(dpy, name, True);
     if (prop == None) return 0;
-    XDevice *dev = XOpenDevice(dpy, devid);      /* XI1 API 需要 XDevice* */
+    XDevice *dev = XOpenDevice(dpy, devid);
     if (!dev) return 0;
     unsigned long n = 0, after = 0;
     int ok = (XGetDeviceProperty(dpy, dev, prop, 0, 64, False, req_type,
                                  type, format, &n, &after, data) == Success);
     XCloseDevice(dpy, dev);
-    if (!ok || !*data || n == 0) { if (*data) { XFree(*data); *data = NULL; } return 0; }
+    if (!ok || !*data || n == 0) {
+        if (*data) { XFree(*data); *data = NULL; }
+        return 0;
+    }
     *nitems = (int)n;
     return 1;
 }
@@ -135,7 +108,6 @@ static int get_ctm(int devid, double m[9]) {
     unsigned char *data = NULL; int n = 0, fmt = 0; Atom type = None;
     if (!get_dev_prop(devid, "Coordinate Transformation Matrix", AnyPropertyType,
                       &data, &n, &type, &fmt)) return 0;
-    /* format==32 的属性按 long 数组返回，FLOAT 要把 32 位位模式重解释成 float */
     if (fmt == 32 && n >= 9) {
         const unsigned long *u = (const unsigned long *)data;
         for (int i = 0; i < 9; i++) {
@@ -158,7 +130,7 @@ static char *get_dev_node(int devid) {
     return buf;
 }
 
-/* ------------------------------------------------------------------ 设备信息 */
+// ---------- 4. 设备信息 ----------
 
 typedef struct {
     int    id;
@@ -174,7 +146,7 @@ static Dev *devs = NULL;
 static int  ndevs = 0;
 
 static int score_label(const char *name) {
-    return strstr(name, "Position") ? 2 : 1;   /* “Position”优先，避开 Tilt X/Y */
+    return strstr(name, "Position") ? 2 : 1;
 }
 
 static void load_dev(Dev *d, XIDeviceInfo *info) {
@@ -214,14 +186,13 @@ static void load_devices(void) {
     XIDeviceInfo *info = XIQueryDevice(dpy, XIAllDevices, &n);
     if (!info) fatal("XIQueryDevice 失败");
     devs = calloc(n ? n : 1, sizeof(Dev));
+    if (!devs) { XIFreeDeviceInfo(info); fatal("内存不足 (calloc %d Dev)", n); }
     ndevs = 0;
     for (int i = 0; i < n; i++) {
         if (!info[i].enabled) continue;
         if (info[i].use == XIMasterPointer || info[i].use == XIMasterKeyboard) continue;
         Dev d; load_dev(&d, &info[i]);
-        /* 主设备也声明 XITouchClass，但它们不产生 raw 触控事件（sourceid 总是从设备） */
         if (!d.is_touch) continue;
-        /* 已经消失但还在设备列表里的“幽灵”打不开，跳过，避免重复统计 */
         XDevice *odev = XOpenDevice(dpy, d.id);
         if (!odev) continue;
         XCloseDevice(dpy, odev);
@@ -235,13 +206,12 @@ static const Dev *find_dev(int id) {
     return NULL;
 }
 
-/* 事件里出现的新设备（热插拔）：现场查询并加入缓存 */
 static const Dev *ensure_dev(int id) {
     const Dev *d = find_dev(id);
     if (d) return d;
     int n = 0;
     XIDeviceInfo *info = XIQueryDevice(dpy, id, &n);
-    if (!info) return NULL;
+    if (!info || n < 1) { if (info) XIFreeDeviceInfo(info); return NULL; }
     Dev nd; memset(&nd, 0, sizeof nd);
     load_dev(&nd, &info[0]);
     XIFreeDeviceInfo(info);
@@ -251,19 +221,18 @@ static const Dev *ensure_dev(int id) {
     return &devs[ndevs - 1];
 }
 
-/* TouchViz 的坐标公式：valuator(已套过变换矩阵) -> 屏幕像素。
- * X server 把设备量程 [min,max] 映射到 [0, W-1]，所以这里也用 W-1/H-1。 */
+// ---------- 5. 坐标换算 ----------
+
 static void overlay_pos(const Dev *d, double vx, double vy, double *ox, double *oy) {
     double nx = (vx - d->mnx) / (d->mxx - d->mnx) * (scr_w - 1);
     double ny = (vy - d->mny) / (d->mxy - d->mny) * (scr_h - 1);
-    if (nx < 0) { nx = 0; }
-    if (nx > scr_w - 1) { nx = scr_w - 1; }
-    if (ny < 0) { ny = 0; }
-    if (ny > scr_h - 1) { ny = scr_h - 1; }
+    if (nx < 0) nx = 0;
+    if (nx > scr_w - 1) nx = scr_w - 1;
+    if (ny < 0) ny = 0;
+    if (ny > scr_h - 1) ny = scr_h - 1;
     *ox = nx; *oy = ny;
 }
 
-/* 设备映射矩形（由 CTM 决定）：设备覆盖桌面的哪一块 */
 static void mapped_rect(const Dev *d, double *x0, double *y0, double *x1, double *y1) {
     double a = d->ctm[0], tx = d->ctm[2], e = d->ctm[4], ty = d->ctm[5];
     double W = scr_w - 1, H = scr_h - 1;
@@ -282,7 +251,6 @@ static void pointer_pos(int *px, int *py) {
     *px = rx; *py = ry;
 }
 
-/* 指针位置可能要等 server 处理完这次触控动作，做一次往返 + 1ms */
 static void pointer_pos_settled(int *px, int *py) {
     XSync(dpy, False);
     struct timespec ts = {0, 1000000L};
@@ -291,19 +259,17 @@ static void pointer_pos_settled(int *px, int *py) {
     pointer_pos(px, py);
 }
 
-/* ------------------------------------------------------------------ geom */
+// ---------- 6. geom ----------
 
 static int cmd_geom(void) {
     printf("DISPLAY=%s  screen=%dx%d  root=%#lx\n",
            DisplayString(dpy), scr_w, scr_h, DefaultRootWindow(dpy));
     load_devices();
-    int nt = 0;
-    for (int i = 0; i < ndevs; i++) nt++;
-    printf("touch_devices=%d\n", nt);
+    printf("touch_devices=%d\n", ndevs);
     return 0;
 }
 
-/* --------------------------------------------------------------- devices */
+// ---------- 7. devices ----------
 
 static int cmd_devices(void) {
     load_devices();
@@ -347,28 +313,27 @@ static int cmd_devices(void) {
     return 0;
 }
 
-/* 注入（mtinject 的像素坐标，等价于“手指在设备上按下的位置”）x,y 之后，
- * 事件里 valuator 会被套上 CTM，最终落点 = (a*x + tx*W, e*y + ty*H) */
+// ---------- 8. expect ----------
+
 static int cmd_expect(int argc, char **argv) {
     if (argc < 2) fatal("expect 需要 x y");
     double x = atof(argv[0]), y = atof(argv[1]);
     load_devices();
     if (!ndevs) fatal("没有触控设备");
     const Dev *d = &devs[0];
-    /* mtinject 按根窗口像素 -> 设备量程；libinput 归一化后套 CTM；server 再 ×(W-1) */
     double sx = (d->ctm[0] * x / scr_w + d->ctm[2]) * (scr_w - 1);
     double sy = (d->ctm[4] * y / scr_h + d->ctm[5]) * (scr_h - 1);
     printf("inject=%.0f,%.0f -> screen=%.0f,%.0f\n", x, y, sx, sy);
     return 0;
 }
 
-/* ----------------------------------------------------------------- watch */
+// ---------- 9. watch ----------
 
 static volatile sig_atomic_t stop_flag = 0;
 static void on_sig(int s) { (void)s; stop_flag = 1; }
 
 static int cmd_watch(int argc, char **argv) {
-    int want = 0, timeout = 0;      /* want=0 表示不限次数 */
+    int want = 0, timeout = 0;
     double tol = 3.0; int quiet = 0;
     for (int i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "-n") && i + 1 < argc) want = atoi(argv[++i]);
@@ -405,6 +370,11 @@ static int cmd_watch(int argc, char **argv) {
             int et = ev.xcookie.evtype;
             if (et == XI_RawTouchBegin || et == XI_RawTouchUpdate) {
                 XIRawEvent *raw = (XIRawEvent *)ev.xcookie.data;
+                // 只判空 valuators.mask 与 valuators.values（raw 由 XGetEventData 保证非 NULL）
+                if (!raw->valuators.mask || !raw->valuators.values) {
+                    XFreeEventData(dpy, &ev.xcookie);
+                    continue;
+                }
                 const Dev *d = ensure_dev(raw->sourceid);
                 if (d && d->is_touch &&
                     XIMaskIsSet(raw->valuators.mask, d->vx) &&
@@ -438,13 +408,16 @@ static int cmd_watch(int argc, char **argv) {
     return bad ? 1 : 0;
 }
 
-/* ------------------------------------------------------------------ PPM */
+// ---------- 10. PPM ----------
 
 typedef struct { int w, h; unsigned char *p; } Img;
 
 static int ppm_token(FILE *f, char *buf, int n) {
     int c;
-    do { c = fgetc(f); if (c == '#') { while (c != '\n' && c != EOF) c = fgetc(f); } } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
+    do {
+        c = fgetc(f);
+        if (c == '#') { while (c != '\n' && c != EOF) c = fgetc(f); }
+    } while (c == ' ' || c == '\t' || c == '\n' || c == '\r');
     if (c == EOF) return 0;
     int i = 0;
     while (c != EOF && c != ' ' && c != '\t' && c != '\n' && c != '\r' && i < n - 1) {
@@ -462,6 +435,7 @@ static int img_read(const char *path, Img *im) {
     if (!ppm_token(f, tok, sizeof tok)) { fclose(f); return 0; } im->w = atoi(tok);
     if (!ppm_token(f, tok, sizeof tok)) { fclose(f); return 0; } im->h = atoi(tok);
     if (!ppm_token(f, tok, sizeof tok)) { fclose(f); return 0; }
+    if (im->w <= 0 || im->h <= 0) { fclose(f); return 0; }
     im->p = malloc((size_t)im->w * im->h * 3);
     if (!im->p) { fclose(f); return 0; }
     size_t got = fread(im->p, 1, (size_t)im->w * im->h * 3, f);
@@ -469,6 +443,8 @@ static int img_read(const char *path, Img *im) {
     if (got != (size_t)im->w * im->h * 3) { free(im->p); im->p = NULL; return 0; }
     return 1;
 }
+
+// ---------- 11. shot ----------
 
 static int cmd_shot(int argc, char **argv) {
     if (argc < 1) fatal("shot 需要输出文件名");
@@ -482,14 +458,14 @@ static int cmd_shot(int argc, char **argv) {
     XImage *img = XGetImage(dpy, DefaultRootWindow(dpy), x, y, w, h, AllPlanes, ZPixmap);
     if (!img) fatal("XGetImage 失败");
     FILE *f = fopen(argv[0], "wb");
-    if (!f) fatal("写不了 %s", argv[0]);
+    if (!f) { XDestroyImage(img); fatal("写不了 %s", argv[0]); }
     fprintf(f, "P6\n%d %d\n255\n", w, h);
     unsigned char *row = malloc((size_t)w * 3);
+    if (!row) { fclose(f); XDestroyImage(img); fatal("内存不足 (row)"); }
     const int bpp = img->bits_per_pixel;
     for (int j = 0; j < h; j++) {
         const unsigned char *src = (const unsigned char *)img->data + (size_t)j * img->bytes_per_line;
         if ((bpp == 32 || bpp == 24) && img->byte_order == LSBFirst) {
-            /* 直接读内存：比 XGetPixel 快一两个数量级（截 4K 屏不会误帧） */
             const int step = bpp / 8;
             for (int i = 0; i < w; i++) {
                 unsigned long p = 0;
@@ -513,7 +489,6 @@ static int cmd_shot(int argc, char **argv) {
     return 0;
 }
 
-/* 区域裁剪到图像范围内 */
 static void clip(int *x, int *y, int *w, int *h, int iw, int ih) {
     if (*x < 0) { *w += *x; *x = 0; }
     if (*y < 0) { *h += *y; *y = 0; }
@@ -522,7 +497,7 @@ static void clip(int *x, int *y, int *w, int *h, int iw, int ih) {
     if (*w <= 0 || *h <= 0) { *w = *h = 0; }
 }
 
-/* ---------------------------------------------------------------- diff */
+// ---------- 12. diff ----------
 
 static int cmd_diff(int argc, char **argv) {
     if (argc < 2) fatal("diff 需要两张 PPM");
@@ -555,14 +530,14 @@ static int cmd_diff(int argc, char **argv) {
             if (d > maxd) maxd = d;
             if (d > thr) {
                 n++; sx += x + i; sy += j;
-                if (x + i < bx0) { bx0 = x + i; }
-                if (x + i > bx1) { bx1 = x + i; }
-                if (j < by0) { by0 = j; }
-                if (j > by1) { by1 = j; }
+                if (x + i < bx0) bx0 = x + i;
+                if (x + i > bx1) bx1 = x + i;
+                if (j < by0) by0 = j;
+                if (j > by1) by1 = j;
             }
         }
     }
-    if (!n) { printf("DIFF none max=%d\n", maxd); return 0; }
+    if (!n) { printf("DIFF none max=%d\n", maxd); free(a.p); free(b.p); return 0; }
     printf("DIFF count=%ld max=%d bbox=%d,%d,%d,%d", n, maxd, bx0, by0, bx1, by1);
     if (centroid) printf(" centroid=%.1f,%.1f", sx / n, sy / n);
     printf("\n");
@@ -570,16 +545,15 @@ static int cmd_diff(int argc, char **argv) {
     return 0;
 }
 
-/* ---------------------------------------------------------------- ring */
+// ---------- 13. ring ----------
 
-/* 在区域内找触点圆环：颜色接近给定 RGB 的像素的质心与包围盒 */
 static int cmd_ring(int argc, char **argv) {
     if (argc < 4) fatal("ring <a.ppm> <x> <y> <pad>");
     Img a = {0};
     const char *file = argv[0];
     int cx = atoi(argv[1]), cy = atoi(argv[2]), pad = atoi(argv[3]);
     int tol = 70;
-    int cr = 51, cg = 191, cb = 255;              /* 槽位 0 的默认颜色 */
+    int cr = 51, cg = 191, cb = 255;
     for (int i = 4; i < argc; i++) {
         if (!strcmp(argv[i], "--tol") && i + 1 < argc) tol = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--color") && i + 1 < argc) {
@@ -597,10 +571,10 @@ static int cmd_ring(int argc, char **argv) {
             int dr = (int)p[i*3+0] - cr, dg = (int)p[i*3+1] - cg, db = (int)p[i*3+2] - cb;
             if (dr*dr + dg*dg + db*db > tol * tol) continue;
             n++; sx += x + i; sy += j;
-            if (x + i < bx0) { bx0 = x + i; }
-            if (x + i > bx1) { bx1 = x + i; }
-            if (j < by0) { by0 = j; }
-            if (j > by1) { by1 = j; }
+            if (x + i < bx0) bx0 = x + i;
+            if (x + i > bx1) bx1 = x + i;
+            if (j < by0) by0 = j;
+            if (j > by1) by1 = j;
         }
     }
     if (!n) { printf("RING none\n"); free(a.p); return 1; }
@@ -612,9 +586,8 @@ static int cmd_ring(int argc, char **argv) {
     return 0;
 }
 
-/* ---------------------------------------------------------------- finger */
+// ---------- 14. finger ----------
 
-/* 把命令写进 mtinject 的 FIFO；daemon 重启过就自动重连一次 */
 static int  fifo_fd = -1;
 static const char *fifo_path = NULL;
 static int  fifo_warned = 0;
@@ -636,7 +609,7 @@ static int fifo_send(const char *s) {
     ssize_t n = write(fifo_fd, s, strlen(s));
     if (n < 0) {
         close(fifo_fd);
-        fifo_fd = -1;                      /* 下次自动重开 */
+        fifo_fd = -1;
         if (!fifo_warned) {
             fprintf(stderr, "touchprobe: 写 FIFO 失败（daemon 重启过？），会自动重连\n");
             fifo_warned = 1;
@@ -654,7 +627,7 @@ static int cmd_finger(int argc, char **argv) {
         if (!strcmp(argv[i], "--fifo") && i + 1 < argc) fifo_path = argv[++i];
         else if (!strcmp(argv[i], "--max-hz") && i + 1 < argc) maxhz = atoi(argv[++i]);
     }
-    if (fifo_send("") < 0) return 1;       /* 先确认 FIFO 能写 */
+    if (fifo_send("") < 0) return 1;
 
     unsigned char mask[XIMaskLen(XI_LASTEVENT)];
     memset(mask, 0, sizeof(mask));
@@ -676,14 +649,14 @@ static int cmd_finger(int argc, char **argv) {
             if (ev.type != GenericEvent || ev.xcookie.extension != xi_opcode) continue;
             if (!XGetEventData(dpy, &ev.xcookie)) continue;
             int et = ev.xcookie.evtype;
-            /* 触控设备自己的按键/移动不要再转发（否则真触控屏会被当成鼠标再灌一遍） */
-            const Dev *src = ensure_dev(((XIRawEvent *)ev.xcookie.data)->sourceid);
+            // 本轮清理：不再判空 XIRawEvent*，直接使用
+            XIRawEvent *raw = (XIRawEvent *)ev.xcookie.data;
+            const Dev *src = ensure_dev(raw->sourceid);
             if (src && src->is_touch) {
                 XFreeEventData(dpy, &ev.xcookie);
                 continue;
             }
             if (et == XI_RawButtonPress || et == XI_RawButtonRelease) {
-                XIRawEvent *raw = (XIRawEvent *)ev.xcookie.data;
                 if (raw->detail == 1) {
                     int px, py; pointer_pos_settled(&px, &py);
                     if (et == XI_RawButtonPress && !down) {
@@ -699,7 +672,10 @@ static int cmd_finger(int argc, char **argv) {
                 }
             } else if (et == XI_RawMotion && down) {
                 long t = now_ms();
-                if (t - last_move < 1000 / (maxhz > 0 ? maxhz : 60)) { XFreeEventData(dpy, &ev.xcookie); continue; }
+                if (t - last_move < 1000 / (maxhz > 0 ? maxhz : 60)) {
+                    XFreeEventData(dpy, &ev.xcookie);
+                    continue;
+                }
                 last_move = t;
                 int px, py; pointer_pos(&px, &py);
                 snprintf(buf, sizeof buf, "move %d %d\n", px, py);
@@ -710,15 +686,14 @@ static int cmd_finger(int argc, char **argv) {
         struct pollfd pfd = { ConnectionNumber(dpy), POLLIN, 0 };
         poll(&pfd, 1, 200);
     }
-    if (down) fifo_send("up\n");         /* 退出时别把触点留在按下状态 */
+    if (down) fifo_send("up\n");
     if (fifo_fd >= 0) close(fifo_fd);
     return 0;
 }
 
-/* ------------------------------------------------------------------ map */
+// ---------- 15. map ----------
 
 static void set_ctm(int devid, const double m[9]) {
-    /* format 32 的属性必须按 long 数组传；FLOAT 要把 float 的位模式塞进 long */
     long v[9];
     for (int i = 0; i < 9; i++) {
         float f = (float)m[i];
@@ -735,7 +710,6 @@ static void set_ctm(int devid, const double m[9]) {
     XCloseDevice(dpy, dev);
 }
 
-/* 把“桌面上的哪块矩形”写成变换矩阵 */
 static void rect_to_ctm(double x, double y, double w, double h, double m[9]) {
     double ident[9] = {1,0,0, 0,1,0, 0,0,1};
     memcpy(m, ident, sizeof ident);
@@ -746,12 +720,12 @@ static void rect_to_ctm(double x, double y, double w, double h, double m[9]) {
 static int cmd_map(int argc, char **argv) {
     load_devices();
     if (!ndevs) fatal("没有触控设备");
-    int id = -1, mode = 0;      /* 1=full 2=rect 3=reset 4=show */
+    int id = -1, mode = 0;
     double rx = 0, ry = 0, rw = 0, rh = 0;
     for (int i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--dev") && i + 1 < argc) id = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--full")) mode = 1;
-        else if (!strcmp(argv[i], "--reset")) mode = 3;
+        else if (!strcmp(argv[i], "--reset")) mode = 3;   // 等价 --full：写单位阵（不删除属性）
         else if (!strcmp(argv[i], "--show")) mode = 4;
         else if (!strcmp(argv[i], "--rect") && i + 4 < argc) {
             mode = 2;
@@ -770,21 +744,19 @@ static int cmd_map(int argc, char **argv) {
     }
     if (mode == 1) rect_to_ctm(0, 0, scr_w, scr_h, m);
     else if (mode == 2) rect_to_ctm(rx, ry, rw, rh, m);
-    else if (mode == 3) rect_to_ctm(0, 0, scr_w, scr_h, m);
+    else if (mode == 3) rect_to_ctm(0, 0, scr_w, scr_h, m);   // 与 --full 等价
     set_ctm(id, m);
     double x0, y0, x1, y1;
     Dev tmp = *d; memcpy(tmp.ctm, m, sizeof m); tmp.has_ctm = 1;
     mapped_rect(&tmp, &x0, &y0, &x1, &y1);
     printf("已设置设备 %d：覆盖桌面 (%.0f,%.0f)-(%.0f,%.0f)\n", id, x0, y0, x1, y1);
     printf("注意：会话内的设置在注销/重启后会回到系统默认（例如 dde-daemon 会把触控屏\n"
-           "      自动映射到主屏）。要长期生效，请在“控制中心 → 显示 → 触摸屏映射”里改。\n");
+           "      自动映射到主屏）。若希望长期生效，请在「控制中心」中修改。\n");
     return 0;
 }
 
-/* ---------------------------------------------------------------- buttons */
+// ---------- 16. buttons ----------
 
-/* 监听真实鼠标按键（含 TouchViz 用 XTEST 合成的右键），带时间戳。
- * 用来验长按出右键的时序：不需要截图，只要看什么时候来了一个 button 3。 */
 static int cmd_buttons(int argc, char **argv) {
     int want = 0, timeout = 0;
     for (int i = 0; i < argc; i++) {
@@ -811,6 +783,7 @@ static int cmd_buttons(int argc, char **argv) {
             if (!XGetEventData(dpy, &ev.xcookie)) continue;
             int et = ev.xcookie.evtype;
             if (et == XI_RawButtonPress || et == XI_RawButtonRelease) {
+                // 本轮清理：不再判空 XIRawEvent*
                 XIRawEvent *raw = (XIRawEvent *)ev.xcookie.data;
                 int is_press = (et == XI_RawButtonPress);
                 if (is_press) { press++; got++; }
@@ -827,11 +800,8 @@ static int cmd_buttons(int argc, char **argv) {
     return 0;
 }
 
+// ---------- 17. cursor ----------
 
-/* ----------------------------------------------------------------- cursor */
-
-/* 打印当前显示的光标信息。TouchViz 隐藏指针时会把光标换成 1x1 透明，
- * 所以用这个判断“触控期间指针是否真的没了”——根窗口截图里根本看不到光标。 */
 static int cmd_cursor(void) {
     XFixesCursorImage *ci = XFixesGetCursorImage(dpy);
     if (!ci) { printf("CURSOR none\n"); return 1; }
@@ -846,10 +816,8 @@ static int cmd_cursor(void) {
     return 0;
 }
 
-/* ---------------------------------------------------------------- latency */
+// ---------- 18. latency ----------
 
-/* 同一个时钟下同时打印「触控开始」与「真实按键」的时间戳。
- * 用来测长按多久才发出右键，不需要截图、也不依赖墙钟。 */
 static int cmd_latency(int argc, char **argv) {
     int timeout = 15;
     for (int i = 0; i < argc; i++)
@@ -874,8 +842,9 @@ static int cmd_latency(int argc, char **argv) {
             if (ev.type != GenericEvent || ev.xcookie.extension != xi_opcode) continue;
             if (!XGetEventData(dpy, &ev.xcookie)) continue;
             int et = ev.xcookie.evtype;
-            long t = now_ms() - t0;
+            // 本轮清理：不再判空 XIRawEvent*
             XIRawEvent *raw = (XIRawEvent *)ev.xcookie.data;
+            long t = now_ms() - t0;
             if (et == XI_RawTouchBegin) {
                 ntouch++;
                 printf("TOUCH t=%ld kind=begin dev=%d slot=%d\n", t, raw->sourceid, raw->detail);
@@ -896,11 +865,9 @@ static int cmd_latency(int argc, char **argv) {
     return 0;
 }
 
-/* ------------------------------------------------------------ 指针 / 点击 */
+// ---------- 19. move / click ----------
 
 static int cmd_move(int argc, char **argv) {
-    /* 用 XTest 移动：和真鼠标一样走“设备 -> 原始事件”这条路
-     * （XWarpPointer 是服务器端直接挪指针，很多地方看不到 raw motion） */
     if (argc < 2) fatal("move 需要 x y");
     XTestFakeMotionEvent(dpy, DefaultScreen(dpy), atoi(argv[0]), atoi(argv[1]), CurrentTime);
     XSync(dpy, False);
@@ -909,7 +876,7 @@ static int cmd_move(int argc, char **argv) {
     return 0;
 }
 
-static int cmd_click(int argc, char **argv) {  /* XTest 合成真实按键，和手指点击一样 */
+static int cmd_click(int argc, char **argv) {
     int btn = argc > 0 ? atoi(argv[0]) : 1;
     int ms  = argc > 1 ? atoi(argv[1]) : 60;
     XTestFakeButtonEvent(dpy, btn, True, CurrentTime);
@@ -922,9 +889,9 @@ static int cmd_click(int argc, char **argv) {  /* XTest 合成真实按键，和
     return 0;
 }
 
-/* ------------------------------------------------------------------ main */
+// ---------- 20. main ----------
 
-static void usage(void) {
+static void print_usage(FILE *out) {
     fputs(
         "用法:\n"
         "  touchprobe geom\n"
@@ -940,11 +907,18 @@ static void usage(void) {
         "  touchprobe move <x> <y>\n"
         "  touchprobe click <button> [ms]\n"
         "  touchprobe cursor\n"
-        "  touchprobe map [--dev ID] --full|--rect X Y W H|--reset|--show\n", stderr);
-    exit(2);
+        "  touchprobe map [--dev ID] --full|--rect X Y W H|--reset|--show\n"
+        "      --reset 等价于 --full：写单位阵（不删除设备属性，跨 server/桌面环境行为一致）\n",
+        out);
 }
 
+static void usage(void) { print_usage(stderr); exit(2); }
+
 int main(int argc, char **argv) {
+    if (argc >= 2 && (!strcmp(argv[1], "-h") || !strcmp(argv[1], "--help"))) {
+        print_usage(stdout);
+        return 0;
+    }
     if (argc < 2) usage();
     const char *cmd = argv[1];
     open_xi();

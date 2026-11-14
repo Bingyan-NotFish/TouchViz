@@ -1,30 +1,4 @@
-/* ============================================================================
- * TouchViz —— X11 触控可视化与长按增强（重写版）
- *
- * 目标：在 X11 会话（KWin/deepin-kwin 等）下，给任意触控屏提供
- *   ① 触点圆点 + 滑动拖尾（看得出按到了哪里、滑到哪里）
- *   ② 长按进度环 + 长按出右键（“稳定期”之后才开始显示进度）
- *   ③ 触控期间隐藏鼠标指针（抬手恢复）
- *   ④ 双指上下滑动可转成滚轮（可选）
- *
- * 设计要点
- *   • 事件源：只订阅 XInput2 的 XI_RawTouchBegin/Update/End（只读、不抢事件）。
- *     鼠标/触控板不产生这类事件，再加上“来源设备必须有 XITouchClass”这道校验，
- *     所以**鼠标永远不会触发任何效果**。
- *   • 设备无关：X/Y 通道按 valuator 标签识别、量程按设备自己声明的 min/max、
- *     触点按 (设备号, 触点号) 归位；换任意厂商的触控屏都不用改代码。
- *   • 坐标：原始事件里的 valuators.values[] 已经是“套过设备变换矩阵”之后的值，
- *     直接按量程归一化 × 屏幕尺寸 即与点击落点一致（多屏/旋转/校准自动跟随）。
- *   • 显示：一个 override-redirect 的 32 位 ARGB 全屏窗口，input shape 置空
- *     => 鼠标/触控完全穿透；只画需要的区域（脏矩形局部清屏）。
- *   • 资源：主循环 poll(X 连接)，没有定时任务时无限期阻塞；
- *     静止的手指不重绘；重绘有 ~60fps 上限；空闲时 0 唤醒、0 CPU。
- *
- * 用法
- *   TouchViz [--no-overlay] [--no-trail] [--no-rightclick] [--no-hide-cursor]
- *            [--scroll] [--long-press MS] [--lp-arm MS] [--lp-move PX]
- *            [--rightclick-at press|release] [--idle-ms MS]
- * ==========================================================================*/
+// TouchViz：主程序，X11 触控可视化与长按增强
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -45,34 +19,34 @@
 #include <cairo/cairo.h>
 #include <cairo/cairo-xlib.h>
 
-/* ============================ Ⅰ. 常量 ================================== */
+// ---------- 1. 常量 ----------
 
-#define MAX_TOUCH      16    /* 同时跟踪的触点数上限 */
-#define TRAIL_MAX      40    /* 每个触点的拖尾采样点上限 */
-#define TRAIL_MIN_DIST 2.0   /* 拖尾采样最小间距(像素)，滤抖 */
-#define DEV_CACHE      8     /* 设备信息缓存条数 */
-#define RECT_MAX       40    /* 脏矩形数量上限 */
+#define MAX_TOUCH      16
+#define TRAIL_MAX      40
+#define TRAIL_MIN_DIST 2.0
+#define DEV_CACHE      8
+#define RECT_MAX       40
 
-/* ============================ Ⅱ. 配置 ================================== */
+// ---------- 2. 配置 ----------
 
 typedef struct {
-    int    overlay;          /* 是否画触点/拖尾/进度环 */
-    int    trail;            /* 是否画滑动拖尾 */
-    int    rightclick;       /* 是否启用“长按 -> 右键” */
-    int    hide_cursor;      /* 触控期间是否隐藏鼠标指针 */
-    int    scroll;           /* 双指同向滑动 -> 滚轮(默认关) */
-    int    long_press_ms;    /* 长按总时长：从【按下】时刻算起到发右键 */
-    int    lp_arm_ms;        /* 稳定期：按下后这段时间【不显示进度】，稳住才开算 */
-    double lp_move_tol;      /* 长按允许的漂移(像素)：超过即作废 */
-    int    rc_on_press;      /* 1=到阈值当场发右键  0=抬手后再发 */
-    int    rc_release_ms;    /* 抬手模式的补发延迟(ms) */
-    int    frame_ms;         /* 动画帧间隔(≈最大帧率间隔) */
-    int    fade_ms;          /* 抬手后圆圈淡出时长 */
-    int    trail_ms;         /* 拖尾保留时长 */
-    int    stale_ms;         /* 漏收 TouchEnd 的兜底清理间隔 */
-    int    raise_ms;         /* 触控期间周期置顶间隔 */
-    int    cursor_restore_ms;/* 抬手后多久恢复鼠标指针 */
-    int    cursor_recheck_ms;/* 触控中重压隐藏的最小间隔 */
+    int    overlay;
+    int    trail;
+    int    rightclick;
+    int    hide_cursor;
+    int    scroll;
+    int    long_press_ms;
+    int    lp_arm_ms;
+    double lp_move_tol;
+    int    rc_on_press;
+    int    rc_release_ms;
+    int    frame_ms;
+    int    fade_ms;
+    int    trail_ms;
+    int    stale_ms;
+    int    raise_ms;
+    int    cursor_restore_ms;
+    int    cursor_recheck_ms;
 } Config;
 
 static Config cfg = {
@@ -83,9 +57,9 @@ static Config cfg = {
     .raise_ms = 2000, .cursor_restore_ms = 120, .cursor_recheck_ms = 500,
 };
 
-#define SCROLL_STEP 24.0     /* 双指滑动多少像素折算一格滚轮 */
+#define SCROLL_STEP 24.0
 
-/* ============================ Ⅲ. 基础工具 ============================== */
+// ---------- 3. 基础工具 ----------
 
 static long now_ms(void) {
     struct timespec ts;
@@ -97,61 +71,59 @@ static double dmin(double a, double b) { return a < b ? a : b; }
 static double dmax(double a, double b) { return a > b ? a : b; }
 static double clampd(double v, double lo, double hi) { return dmax(lo, dmin(hi, v)); }
 
-/* ==================== Ⅳ. 屏幕 / 显示 / 覆盖层 ========================== */
+// ---------- 4. 屏幕 / 显示 / 覆盖层 ----------
 
 static Display *dpy;
 static int      scr;
-static int      scr_w, scr_h;         /* 逻辑屏幕尺寸(整个 X 屏，多屏合并后的) */
+static int      scr_w, scr_h;
 static int      xi_opcode;
 static Window   overlay_win = 0;
 static cairo_surface_t *ovl_surf;
 static cairo_t         *ovl_cr;
-static int      overlay_dirty = 0;    /* 需要重绘 */
-static int      overlay_lost = 0;     /* 覆盖层窗口被销毁，待重建 */
-static int      overlay_painted = 0;  /* 上一帧是否画了内容（用于收尾清屏） */
+static int      overlay_dirty = 0;
+static int      overlay_lost = 0;
+static int      overlay_painted = 0;
 
-/* 上一帧使用过的脏矩形：下一帧要把它们擦掉 */
 typedef struct { int x, y, w, h; } Rect;
 static Rect prev_rects[RECT_MAX];
 static int  prev_nrects = 0;
 static int  rect_overflow = 0, prev_rect_overflow = 0;
 
-static long raise_at = 0;             /* 下次周期置顶的时刻 */
-static long render_at = 0;            /* 被帧率上限推迟的重绘时刻 */
+static long raise_at = 0;
+static long render_at = 0;
 static long last_render_ms = 0;
 
 static volatile sig_atomic_t got_signal = 0;
 
-/* ==================== Ⅴ. 触点 / 拖尾 ================================== */
+// ---------- 5. 触点 / 拖尾 ----------
 
 typedef enum {
-    PH_NONE = 0,     /* 槽位空闲 */
-    PH_SETTLE,       /* 已按下，处于稳定期：不显示进度 */
-    PH_CHARGE,       /* 稳定期已过，进度环在长 */
-    PH_ARMED,        /* 进度已满、等抬手补发右键(release 模式) */
-    PH_DEAD,         /* 本次长按已作废(移动/多指/已发过) */
+    PH_NONE = 0,
+    PH_SETTLE,
+    PH_CHARGE,
+    PH_ARMED,
+    PH_DEAD,
 } Phase;
 
 typedef struct {
-    int    active;                   /* 手指是否还按着 */
-    int    dev, id;                  /* 来源设备号 + 触点号(归位用) */
-    int    have_pos;                 /* 是否解析出过有效坐标 */
-    double x, y;                     /* 当前坐标 */
-    double sx, sy;                   /* 按下时的坐标(判漂移用) */
-    long   t_down, t_last, t_end;    /* 按下/最后上报/抬手时刻 */
+    int    active;
+    int    dev, id;
+    int    have_pos;
+    double x, y;
+    double sx, sy;
+    long   t_down, t_last, t_end;
     Phase  phase;
-    long   arm_at;                   /* 稳定期结束时刻 = t_down + lp_arm_ms */
-    int    fired;                    /* 本次长按是否已经发过右键 */
-    double scroll_acc;               /* 双指滚轮累计 */
+    long   arm_at;
+    int    fired;
+    double scroll_acc;
     double tx[TRAIL_MAX], ty[TRAIL_MAX];
     long   tt[TRAIL_MAX];
-    int    tn;                       /* 拖尾采样点数 */
+    int    tn;
 } Touch;
 
 static Touch touches[MAX_TOUCH];
-static long  no_touch_since = 0;     /* 最近一次“所有手指都抬起”的时刻 */
+static long  no_touch_since = 0;
 
-/* release 模式：待补发的右键 */
 static long pending_click_at = 0;
 static int  pending_click_x = 0, pending_click_y = 0;
 
@@ -180,7 +152,7 @@ static Touch *touch_begin(int dev, int id) {
             return &touches[i];
         }
     }
-    return NULL;                     /* 超过上限：忽略这个触点 */
+    return NULL;
 }
 
 static void touch_end(Touch *t, long now) {
@@ -189,7 +161,6 @@ static void touch_end(Touch *t, long now) {
     t->phase = PH_NONE;
 }
 
-/* 拖尾：按间距采样 + 按时间淘汰 */
 static void trail_push(Touch *t, double x, double y, long now) {
     if (t->tn > 0) {
         double dx = x - t->tx[t->tn - 1], dy = y - t->ty[t->tn - 1];
@@ -216,21 +187,20 @@ static void trail_prune(Touch *t, long now) {
     }
 }
 
-/* ==================== Ⅵ. 设备信息（设备无关的关键） ==================== */
+// ---------- 6. 设备信息 ----------
 
 typedef struct {
     int    used;
     int    id;
-    int    is_touch;                 /* 有没有 XITouchClass */
-    int    vx, vy;                   /* X/Y 落在第几个 valuator */
-    double mnx, mxx, mny, mxy;       /* 量程 */
+    int    is_touch;
+    int    vx, vy;
+    double mnx, mxx, mny, mxy;
 } DeviceInfo;
 
 static DeviceInfo dev_cache[DEV_CACHE];
 static int dev_cache_next = 0;
-static int cur_dev = -1;             /* 最近一次查询的设备(同一条流快路径) */
+static int cur_dev = -1;
 
-/* 查询/缓存某设备的信息；返回 NULL 表示查不到 */
 static const DeviceInfo *dev_lookup(int devid) {
     if (devid == cur_dev) {
         for (int i = 0; i < DEV_CACHE; i++)
@@ -258,7 +228,7 @@ static const DeviceInfo *dev_lookup(int devid) {
         if (!name) continue;
         int L = strlen(name);
         char last = L ? name[L - 1] : 0;
-        int score = strstr(name, "Position") ? 2 : 1;   /* “Position”优先，避开 Tilt X/Y */
+        int score = strstr(name, "Position") ? 2 : 1;
         if (last == 'X' || last == 'x') {
             if (score > score_x) { score_x = score; d.vx = v->number; d.mnx = v->min; d.mxx = v->max; }
         } else if (last == 'Y' || last == 'y') {
@@ -267,7 +237,7 @@ static const DeviceInfo *dev_lookup(int devid) {
         XFree(name);
     }
     XIFreeDeviceInfo(info);
-    if (score_x < 0 && num0 == 0 && mx0 > mn0) { d.vx = 0; d.mnx = mn0; d.mxx = mx0; }  /* 没标签退回 0/1 */
+    if (score_x < 0 && num0 == 0 && mx0 > mn0) { d.vx = 0; d.mnx = mn0; d.mxx = mx0; }
     if (score_y < 0 && num1 == 1 && mx1 > mn1) { d.vy = 1; d.mny = mn1; d.mxy = mx1; }
     if (d.mxx <= d.mnx) { d.mnx = 0; d.mxx = 65535; }
     if (d.mxy <= d.mny) { d.mny = 0; d.mxy = 65535; }
@@ -281,7 +251,6 @@ static const DeviceInfo *dev_lookup(int devid) {
     return slot;
 }
 
-/* X 错误：操作“刚好消失的窗口”是正常的，不刷屏；覆盖层真被销毁则标记重建 */
 static int xerr_handler(Display *d, XErrorEvent *e) {
     if (e->error_code == BadWindow || e->error_code == BadDrawable || e->error_code == BadCursor) {
         if (cfg.overlay && overlay_win && (Window)e->resourceid == overlay_win) overlay_lost = 1;
@@ -293,10 +262,10 @@ static int xerr_handler(Display *d, XErrorEvent *e) {
     return 0;
 }
 
-/* ==================== Ⅶ. 鼠标指针隐藏 ================================= */
+// ---------- 7. 鼠标指针隐藏 ----------
 
 static Cursor blank_cursor = None;
-static Window blanked_win = None;    /* 当前被设成透明光标的窗口 */
+static Window blanked_win = None;
 static int    cursor_hidden = 0;
 static int    last_hide_x = -1000, last_hide_y = -1000;
 static long   last_hide_ms = 0;
@@ -304,7 +273,7 @@ static long   cursor_recheck_at = 0;
 
 static void make_blank_cursor(void) {
     Window root = DefaultRootWindow(dpy);
-    Pixmap pm = XCreatePixmap(dpy, root, 1, 1, 1);          /* mask 全 0 => 完全不可见 */
+    Pixmap pm = XCreatePixmap(dpy, root, 1, 1, 1);
     XGCValues gcv; memset(&gcv, 0, sizeof(gcv));
     GC gc = XCreateGC(dpy, pm, 0, &gcv);
     XSetForeground(dpy, gc, 0);
@@ -313,9 +282,12 @@ static void make_blank_cursor(void) {
     blank_cursor = XCreatePixmapCursor(dpy, pm, pm, &zero, &zero, 0, 0);
     XFreeGC(dpy, gc);
     XFreePixmap(dpy, pm);
+    if (blank_cursor == None) {
+        fprintf(stderr, "[TouchViz] 无法创建透明光标，禁用隐藏指针\n");
+        cfg.hide_cursor = 0;
+    }
 }
 
-/* 指针所在的(最深层)窗口：最多往下探 6 层就够 */
 static Window window_under_pointer(void) {
     Window root = DefaultRootWindow(dpy), w = root, child = None;
     int rx, ry, wx, wy; unsigned int mask;
@@ -328,8 +300,6 @@ static Window window_under_pointer(void) {
     return w;
 }
 
-/* 隐藏指针：XFixes 全局隐藏 + 把指针下窗口的 cursor 临时设成全透明
- * （第二个动作会强制 X server 立刻重绘，解决“手指不动时已画出的箭头不消失”） */
 static void cursor_hide(int x, int y) {
     Window root = DefaultRootWindow(dpy);
     if (!cursor_hidden) {
@@ -339,7 +309,7 @@ static void cursor_hide(int x, int y) {
     }
     long now = now_ms();
     int moved = (x < 0) || (abs(x - last_hide_x) + abs(y - last_hide_y) > 4);
-    if (!moved && now - last_hide_ms < cfg.cursor_recheck_ms) return;   /* 位置没变就别重复查窗口 */
+    if (!moved && now - last_hide_ms < cfg.cursor_recheck_ms) return;
     last_hide_x = x; last_hide_y = y; last_hide_ms = now;
     Window w = window_under_pointer();
     if (w != blanked_win) {
@@ -361,7 +331,7 @@ static void cursor_show(void) {
     XFlush(dpy);
 }
 
-/* ==================== Ⅷ. 输入动作（XTEST） ============================ */
+// ---------- 8. 输入动作（XTEST） ----------
 
 static void synth_right_click(int x, int y) {
     fprintf(stderr, "[TouchViz] 长按 -> 右键 (%d,%d)\n", x, y);
@@ -377,55 +347,48 @@ static void synth_wheel(int button) {
     XFlush(dpy);
 }
 
-/* ==================== Ⅸ. 长按状态机 =================================== */
+// ---------- 9. 长按状态机 ----------
 
-/* 该触点是否还是“长按候选”（没作废、没发过、单指、没漂移、坐标有效） */
-static int lp_candidate(Touch *t) {
+static int lp_candidate(Touch *t, int n_active) {
     if (!cfg.rightclick || cfg.long_press_ms <= 0) return 0;
     if (!t->active || !t->have_pos || t->t_down <= 0) return 0;
     if (t->phase == PH_DEAD || t->phase == PH_ARMED || t->fired) return 0;
-    if (active_count() != 1) return 0;
+    if (n_active != 1) return 0;
     double dx = t->x - t->sx, dy = t->y - t->sy;
     return dx * dx + dy * dy <= cfg.lp_move_tol * cfg.lp_move_tol;
 }
 
-/* 进度 0..1；只有已按下(有 Begin)且过了稳定期的触点才显示进度 */
 static int lp_progress(Touch *t, long now, double *progress) {
     *progress = 0.0;
     if (t->phase == PH_ARMED) { *progress = 1.0; return 1; }
     if (t->phase != PH_SETTLE && t->phase != PH_CHARGE) return 0;
-    if (t->t_down <= 0) return 0;                       /* 没按下时刻的(漏了 Begin)不显示 */
-    if (now < t->arm_at) return 0;                      /* 稳定期内：不显示进度 */
+    if (t->t_down <= 0) return 0;
+    if (now < t->arm_at) return 0;
     long span = cfg.long_press_ms - cfg.lp_arm_ms;
     if (span <= 0) span = 1;
     *progress = clampd((double)(now - t->arm_at) / (double)span, 0.0, 1.0);
     return 1;
 }
 
-/* 推进长按状态机；返回 1 表示状态/显示发生了变化（需要重绘） */
-static int lp_tick(Touch *t, long now) {
+static int lp_tick(Touch *t, long now, int n_active) {
     if (!t->active || !cfg.rightclick || cfg.long_press_ms <= 0) return 0;
 
-    /* 多指：任何第二根手指出现 => 本次长按作废 */
-    if (active_count() >= 2 && t->phase != PH_DEAD) {
+    if (n_active >= 2 && t->phase != PH_DEAD) {
         t->phase = PH_DEAD;
         overlay_dirty = 1;
         return 1;
     }
-    /* 稳定期内漂移过多 => 作废 */
-    if ((t->phase == PH_SETTLE || t->phase == PH_CHARGE) && !lp_candidate(t)) {
+    if ((t->phase == PH_SETTLE || t->phase == PH_CHARGE) && !lp_candidate(t, n_active)) {
         t->phase = PH_DEAD;
         overlay_dirty = 1;
         return 1;
     }
     if (!t->have_pos) return 0;
 
-    /* 稳定期结束 -> 开始长进度环（若稳定期被压到 0 则直接进入 charging） */
     if (t->phase == PH_SETTLE && now >= t->arm_at) {
         t->phase = PH_CHARGE;
         overlay_dirty = 1;
     }
-    /* 到达阈值 */
     if ((t->phase == PH_SETTLE || t->phase == PH_CHARGE) &&
         now - t->t_down >= cfg.long_press_ms) {
         t->fired = 1;
@@ -433,7 +396,7 @@ static int lp_tick(Touch *t, long now) {
             t->phase = PH_DEAD;
             synth_right_click((int)t->x, (int)t->y);
         } else {
-            t->phase = PH_ARMED;            /* 抬手时再补发 */
+            t->phase = PH_ARMED;
         }
         overlay_dirty = 1;
         return 1;
@@ -441,15 +404,17 @@ static int lp_tick(Touch *t, long now) {
     return 0;
 }
 
-/* ==================== Ⅹ. 绘制 ========================================= */
+// ---------- 10. 绘制 ----------
 
 static const double PALETTE[][3] = {
     {0.20, 0.75, 1.00}, {1.00, 0.45, 0.30}, {0.45, 0.95, 0.45}, {1.00, 0.85, 0.25},
     {0.80, 0.55, 1.00}, {0.35, 1.00, 0.90}, {1.00, 0.55, 0.80}, {0.95, 0.95, 0.95},
 };
 
-#define LP_RING_R 32.0    /* 进度环半径（在触点圆外侧） */
-#define LP_RING_W 4.0     /* 进度环线宽 */
+#define CIRCLE_R_BASE 24.0
+#define CIRCLE_R_MAX  (CIRCLE_R_BASE + 12.0 + 4.0)
+#define LP_RING_R     32.0
+#define LP_RING_W     4.0
 
 static int touch_visible(const Touch *t, long now) {
     if (t->active) return 1;
@@ -467,7 +432,6 @@ static void rect_add(Rect *rs, int *n, int x, int y, int w, int h) {
     (*n)++;
 }
 
-/* 只擦一个矩形（裁剪后 paint，写入量 = 该区域而不是整屏） */
 static void clear_rect(Rect r) {
     cairo_save(ovl_cr);
     cairo_rectangle(ovl_cr, r.x, r.y, r.w, r.h);
@@ -478,18 +442,14 @@ static void clear_rect(Rect r) {
     cairo_restore(ovl_cr);
 }
 
-/* 一个触点的圆圈半径上限（含淡出时的放大与线宽） */
-#define CIRCLE_R_MAX (24.0 + 12.0 + 4.0)
-
 static void draw_touch(cairo_t *cr, const Touch *t, long now, double alpha, const double *col) {
-    const double base_r = 24.0;
+    const double base_r = CIRCLE_R_BASE;
 
-    /* ---- 滑动拖尾：逐段加粗、越新越不透明 ---- */
     if (cfg.trail && t->tn >= 2) {
         cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
         cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
         for (int k = 1; k < t->tn; k++) {
-            double f   = (double)k / t->tn;                        /* 0=最旧 1=最新 */
+            double f   = (double)k / t->tn;
             double age = (double)(now - t->tt[k]) / cfg.trail_ms;
             cairo_set_source_rgba(cr, col[0], col[1], col[2],
                                   alpha * 0.75 * f * (1.0 - clampd(age, 0.0, 1.0)));
@@ -500,7 +460,6 @@ static void draw_touch(cairo_t *cr, const Touch *t, long now, double alpha, cons
         }
     }
 
-    /* ---- 触点圆圈 ---- */
     double r = base_r + (t->active ? 0.0 : (1.0 - alpha) * 12.0);
     cairo_set_line_width(cr, 3.0);
     cairo_set_source_rgba(cr, col[0], col[1], col[2], 0.95 * alpha);
@@ -513,21 +472,20 @@ static void draw_touch(cairo_t *cr, const Touch *t, long now, double alpha, cons
     cairo_arc(cr, t->x, t->y, 4.5, 0, 2 * M_PI);
     cairo_fill(cr);
 
-    /* ---- 长按进度环：稳定期内不画；稳定期后白色弧从正上方顺时针涨满 ---- */
     double p = 0;
     if (lp_progress((Touch *)t, now, &p)) {
         cairo_set_line_width(cr, LP_RING_W);
-        cairo_set_source_rgba(cr, col[0], col[1], col[2], 0.20 * alpha);   /* 暗底环 */
+        cairo_set_source_rgba(cr, col[0], col[1], col[2], 0.20 * alpha);
         cairo_arc(cr, t->x, t->y, LP_RING_R, 0, 2 * M_PI);
         cairo_stroke(cr);
         if (p > 0.002) {
             double a0 = -M_PI / 2;
             cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-            cairo_set_source_rgba(cr, 0.97, 0.97, 0.97, 0.95 * alpha);     /* 进度弧 */
+            cairo_set_source_rgba(cr, 0.97, 0.97, 0.97, 0.95 * alpha);
             cairo_arc(cr, t->x, t->y, LP_RING_R, a0, a0 + 2 * M_PI * p);
             cairo_stroke(cr);
         }
-        if (t->phase == PH_ARMED) {                                        /* 就绪：再加一圈亮环 */
+        if (t->phase == PH_ARMED) {
             cairo_set_line_width(cr, 2.0);
             cairo_set_source_rgba(cr, col[0], col[1], col[2], 0.95 * alpha);
             cairo_arc(cr, t->x, t->y, LP_RING_R + LP_RING_W + 1.5, 0, 2 * M_PI);
@@ -537,11 +495,10 @@ static void draw_touch(cairo_t *cr, const Touch *t, long now, double alpha, cons
 }
 
 static void overlay_render(void) {
-    if (!ovl_cr) return;
+    if (!ovl_cr || !ovl_surf) return;
     long now = now_ms();
     for (int i = 0; i < MAX_TOUCH; i++) if (touches[i].active) trail_prune(&touches[i], now);
 
-    /* 1) 收集这一帧要画的东西的脏矩形 */
     Rect nr[RECT_MAX];
     int nn = 0, drew = 0;
     for (int i = 0; i < MAX_TOUCH; i++) {
@@ -566,7 +523,6 @@ static void overlay_render(void) {
         drew = 1;
     }
 
-    /* 2) 擦除：上一帧的矩形 + 本帧的矩形；万一矩形太多就整屏清一次 */
     if (rect_overflow || prev_rect_overflow) {
         Rect full = {0, 0, scr_w, scr_h};
         clear_rect(full);
@@ -577,7 +533,6 @@ static void overlay_render(void) {
     prev_rect_overflow = rect_overflow;
     rect_overflow = 0;
 
-    /* 3) 绘制（裁剪到本帧脏矩形并集） */
     if (drew) {
         cairo_save(ovl_cr);
         for (int k = 0; k < nn; k++)
@@ -594,7 +549,6 @@ static void overlay_render(void) {
         cairo_restore(ovl_cr);
     }
 
-    /* 4) 记住本帧脏区 */
     memcpy(prev_rects, nr, sizeof(Rect) * nn);
     prev_nrects = nn;
     overlay_painted = drew;
@@ -629,7 +583,6 @@ static void overlay_create(void) {
     overlay_win = XCreateWindow(dpy, root, 0, 0, scr_w, scr_h, 0, vinfo.depth,
                                 InputOutput, vinfo.visual,
                                 CWOverrideRedirect | CWColormap | CWBackPixel | CWBorderPixel, &at);
-    /* input shape 置空 => 鼠标/触控事件全部穿透 */
     XShapeCombineRectangles(dpy, overlay_win, ShapeInput, 0, 0, NULL, 0, ShapeSet, Unsorted);
     XStoreName(dpy, overlay_win, "TouchViz-overlay");
     XMapRaised(dpy, overlay_win);
@@ -646,7 +599,6 @@ static void overlay_destroy(void) {
     overlay_painted = 0;
 }
 
-/* 分辨率/旋转变了：窗口与画布都重建 */
 static void overlay_check_size(void) {
     int nw = DisplayWidth(dpy, scr), nh = DisplayHeight(dpy, scr);
     if (nw == scr_w && nh == scr_h) return;
@@ -660,9 +612,8 @@ static void overlay_check_size(void) {
     fprintf(stderr, "[TouchViz] 屏幕尺寸变化 -> %dx%d\n", scr_w, scr_h);
 }
 
-/* ==================== Ⅺ. 渲染调度 ===================================== */
+// ---------- 11. 渲染调度 ----------
 
-/* 这一帧是否必须画（内容会不会变） */
 static int render_needed(long now) {
     if (overlay_dirty) return 1;
     int any = 0;
@@ -670,17 +621,16 @@ static int render_needed(long now) {
         Touch *t = &touches[i];
         if (t->active) {
             any = 1;
-            if (cfg.trail && t->tn >= 2) return 1;              /* 拖尾还在随时间变淡/收缩 */
+            if (cfg.trail && t->tn >= 2) return 1;
             double p;
-            if (lp_progress(t, now, &p) && p < 1.0) return 1;   /* 进度环在长 */
+            if (lp_progress(t, now, &p) && p < 1.0) return 1;
         } else if (touch_visible(t, now)) {
-            return 1;                                           /* 淡出动画中 */
+            return 1;
         }
     }
-    return (!any && overlay_painted);                           /* 收尾：最后清一帧成全透明 */
+    return (!any && overlay_painted);
 }
 
-/* 距离下次必须醒来的毫秒数；-1 = 可以一直睡到有事件 */
 static int next_wait_ms(long now) {
     long best = -1;
 #define NEED(deadline) do { long d_ = (deadline); \
@@ -692,27 +642,27 @@ static int next_wait_ms(long now) {
         if (t->active) {
             act = 1;
             if (cfg.overlay) {
-                if (cfg.trail && t->tn >= 2) NEED(now + cfg.frame_ms);   /* 拖尾动画帧 */
+                if (cfg.trail && t->tn >= 2) NEED(now + cfg.frame_ms);
                 double p;
-                if (lp_progress(t, now, &p) && p < 1.0) NEED(now + cfg.frame_ms);  /* 进度环动画帧 */
-                if (t->phase == PH_SETTLE) NEED(t->arm_at);              /* 稳定期结束的那一刻要准时画 */
-                NEED(raise_at);                                          /* 周期置顶 */
+                if (lp_progress(t, now, &p) && p < 1.0) NEED(now + cfg.frame_ms);
+                if (t->phase == PH_SETTLE) NEED(t->arm_at);
+                NEED(raise_at);
             }
             if (cfg.rightclick && cfg.long_press_ms > 0 && !t->fired &&
                 t->phase != PH_DEAD && t->phase != PH_ARMED)
-                NEED(t->t_down + cfg.long_press_ms);                     /* 到阈值要准时发右键 */
-            if (t->t_last) NEED(t->t_last + cfg.stale_ms + 1);           /* 漏收 End 的兜底 */
+                NEED(t->t_down + cfg.long_press_ms);
+            if (t->t_last) NEED(t->t_last + cfg.stale_ms + 1);
             if (cursor_hidden) NEED(cursor_recheck_at);
         } else if (touch_visible(t, now)) {
-            NEED(now + cfg.frame_ms);                                    /* 淡出帧 */
+            NEED(now + cfg.frame_ms);
         }
     }
     if (!act && cursor_hidden) NEED(no_touch_since + cfg.cursor_restore_ms + 1);
-    if (pending_click_at) {                                              /* 待补发的右键 */
+    if (pending_click_at) {
         if (pending_click_at <= now) return 0;
         NEED(pending_click_at);
     }
-    if (render_at) {                                                     /* 被帧率上限推迟的重绘 */
+    if (render_at) {
         if (render_at <= now) return 0;
         NEED(render_at);
     }
@@ -721,10 +671,9 @@ static int next_wait_ms(long now) {
 #undef NEED
 }
 
-/* ==================== Ⅻ. 事件处理 ===================================== */
+// ---------- 12. 事件处理 ----------
 
-
-static void handle_motion_from_touch(Touch *t, double nx, double ny, int is_begin, long now) {
+static void handle_motion_from_touch(Touch *t, double nx, double ny, int is_begin, long now, int n_active) {
     if (is_begin) {
         t->have_pos = 1;
         t->x = t->sx = nx;
@@ -738,7 +687,7 @@ static void handle_motion_from_touch(Touch *t, double nx, double ny, int is_begi
     } else {
         t->have_pos = 1;
         if (cfg.trail) trail_push(t, nx, ny, now);
-        if (cfg.scroll && active_count() == 2) {                 /* 双指同向滑动 -> 滚轮 */
+        if (cfg.scroll && n_active == 2) {
             t->scroll_acc += ny - t->y;
             while (t->scroll_acc <= -SCROLL_STEP) { synth_wheel(5); t->scroll_acc += SCROLL_STEP; }
             while (t->scroll_acc >=  SCROLL_STEP) { synth_wheel(4); t->scroll_acc -= SCROLL_STEP; }
@@ -759,9 +708,10 @@ static void handle_event(XEvent *ev) {
         return;
     }
 
+    // 本轮清理：XGetEventData 返回 True 即保证 cookie.data 非 NULL，故不再判 raw。
     XIRawEvent *raw = (XIRawEvent *)ev->xcookie.data;
     const DeviceInfo *dev = dev_lookup(raw->sourceid);
-    if (!dev || !dev->is_touch) {              /* 不是触控设备的原始事件：一律不理 */
+    if (!dev || !dev->is_touch) {
         XFreeEventData(dpy, &ev->xcookie);
         return;
     }
@@ -771,23 +721,22 @@ static void handle_event(XEvent *ev) {
     Touch *t = (et == XI_RawTouchEnd) ? touch_find(raw->sourceid, id)
                                       : touch_begin(raw->sourceid, id);
     if (t) {
-        int have_xy = XIMaskIsSet(raw->valuators.mask, dev->vx) &&
+        // valuators.mask / .values 在 num_valuators==0 时确实可能为 NULL，保留判空。
+        int have_xy = raw->valuators.mask && raw->valuators.values &&
+                      XIMaskIsSet(raw->valuators.mask, dev->vx) &&
                       XIMaskIsSet(raw->valuators.mask, dev->vy);
-        if (et == XI_RawTouchBegin) overlay_check_size();     /* 顺手处理分辨率/旋转变化 */
+        if (et == XI_RawTouchBegin) overlay_check_size();
         if (have_xy) {
-            /* 原始事件的 valuators.values[] 已经套过设备变换矩阵，
-             * 按设备量程归一化 × 屏幕尺寸 就是点击的真实落点。
-             * 注意：X server 把 [min,max] 映射到 [0, W-1]（不是 W），
-             * 所以这里也用 W-1/H-1，才能和指针落点像素级重合。 */
             double nx = (raw->valuators.values[dev->vx] - dev->mnx) / (dev->mxx - dev->mnx) * (scr_w - 1);
             double ny = (raw->valuators.values[dev->vy] - dev->mny) / (dev->mxy - dev->mny) * (scr_h - 1);
             nx = clampd(nx, 0, scr_w - 1);
             ny = clampd(ny, 0, scr_h - 1);
             t->t_last = now;
-            handle_motion_from_touch(t, nx, ny, et == XI_RawTouchBegin, now);
+            int n_active = active_count();
+            handle_motion_from_touch(t, nx, ny, et == XI_RawTouchBegin, now, n_active);
         }
         if (et == XI_RawTouchEnd) {
-            if (t->phase == PH_ARMED && cfg.rightclick) {     /* release 模式：抬手后补发右键 */
+            if (t->phase == PH_ARMED && cfg.rightclick) {
                 pending_click_x = (int)t->x;
                 pending_click_y = (int)t->y;
                 pending_click_at = now + cfg.rc_release_ms;
@@ -799,10 +748,9 @@ static void handle_event(XEvent *ev) {
     XFreeEventData(dpy, &ev->xcookie);
 }
 
-/* ==================== XIII. 主循环 ==================================== */
+// ---------- 13. 主循环 ----------
 
 static void on_signal(int sig) {
-    /* 信号处理函数里绝对不能碰 Xlib（会在锁上死锁），只置标志 */
     (void)sig;
     got_signal = 1;
 }
@@ -811,13 +759,14 @@ static void tick_touches(long now) {
     for (int i = 0; i < MAX_TOUCH; i++) {
         Touch *t = &touches[i];
         if (!t->active) continue;
-        if (t->t_last && now - t->t_last > cfg.stale_ms) {     /* 漏收 End 的兜底 */
+        if (t->t_last && now - t->t_last > cfg.stale_ms) {
             touch_end(t, now);
             overlay_dirty = 1;
-            continue;
         }
-        lp_tick(t, now);
     }
+    int n_active = active_count();
+    for (int i = 0; i < MAX_TOUCH; i++)
+        if (touches[i].active) lp_tick(&touches[i], now, n_active);
 }
 
 int main(int argc, char **argv) {
@@ -835,6 +784,8 @@ int main(int argc, char **argv) {
             cfg.rc_on_press = !strcmp(argv[++i], "press");
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             printf("用法: %s [选项]\n"
+                   "  触控点显示与增强（X11）：触点圆点、滑动拖尾、长按进度环、长按出右键、触控时隐藏指针。\n"
+                   "选项:\n"
                    "  --no-overlay         不显示触点(只做长按/隐藏指针)\n"
                    "  --no-trail           不画滑动拖尾\n"
                    "  --no-rightclick      关闭长按->右键\n"
@@ -853,11 +804,10 @@ int main(int argc, char **argv) {
             return 2;
         }
     }
-    /* 参数自检 */
     if (cfg.long_press_ms < 0) cfg.long_press_ms = 0;
     if (cfg.lp_arm_ms < 0) cfg.lp_arm_ms = 0;
     if (cfg.long_press_ms > 0 && cfg.lp_arm_ms >= cfg.long_press_ms)
-        cfg.lp_arm_ms = cfg.long_press_ms / 3;      /* 稳定期必须短于总时长 */
+        cfg.lp_arm_ms = cfg.long_press_ms / 3;
     if (cfg.lp_move_tol < 1) cfg.lp_move_tol = 1;
     if (cfg.frame_ms < 4) cfg.frame_ms = 4;
 
@@ -882,7 +832,6 @@ int main(int argc, char **argv) {
     signal(SIGINT,  on_signal);
     signal(SIGHUP,  on_signal);
 
-    /* 只订阅原始触控事件（只读，不影响事件投递给应用） */
     unsigned char mask[(XI_LASTEVENT + 7) / 8];
     memset(mask, 0, sizeof(mask));
     XISetMask(mask, XI_RawTouchBegin);
@@ -915,7 +864,6 @@ int main(int argc, char **argv) {
             handle_event(&ev);
         }
 
-        /* 覆盖层被别的东西销毁了：重建，别一直往死窗口画 */
         if (overlay_lost) {
             overlay_lost = 0;
             if (cfg.overlay) {
@@ -928,7 +876,6 @@ int main(int argc, char **argv) {
         long now = now_ms();
         tick_touches(now);
 
-        /* release 模式的补发右键 */
         if (pending_click_at && now >= pending_click_at) {
             pending_click_at = 0;
             synth_right_click(pending_click_x, pending_click_y);
@@ -939,7 +886,7 @@ int main(int argc, char **argv) {
             if (cursor_hidden && now - no_touch_since >= cfg.cursor_restore_ms) cursor_show();
         } else {
             no_touch_since = 0;
-            if (cfg.overlay && now >= raise_at) {           /* 触控期间才周期置顶 */
+            if (cfg.overlay && overlay_win && now >= raise_at) {
                 raise_at = now + cfg.raise_ms;
                 XRaiseWindow(dpy, overlay_win);
                 XFlush(dpy);
@@ -948,13 +895,15 @@ int main(int argc, char **argv) {
                 cursor_recheck_at = now + cfg.cursor_recheck_ms;
                 int px = 0, py = 0;
                 for (int i = 0; i < MAX_TOUCH; i++)
-                    if (touches[i].active && touches[i].have_pos) { px = (int)touches[i].x; py = (int)touches[i].y; }
+                    if (touches[i].active && touches[i].have_pos) {
+                        px = (int)touches[i].x; py = (int)touches[i].y;
+                    }
                 cursor_hide(px, py);
             }
         }
 
         if (cfg.overlay && render_needed(now)) {
-            if (now - last_render_ms >= cfg.frame_ms / 2) {  /* 帧率上限 ~60fps */
+            if (now - last_render_ms >= cfg.frame_ms / 2) {
                 overlay_dirty = 0;
                 render_at = 0;
                 last_render_ms = now;
@@ -969,6 +918,6 @@ int main(int argc, char **argv) {
         pfd.fd = ConnectionNumber(dpy);
         pfd.events = POLLIN;
         pfd.revents = 0;
-        poll(&pfd, 1, wait);          /* wait<0 => 无限期阻塞（空闲 0 唤醒、0 CPU） */
+        poll(&pfd, 1, wait);
     }
 }
